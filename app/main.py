@@ -3,6 +3,7 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routes import auth, pedidos
+from app.routers import ui
 
 app = FastAPI(title="Dirac – Pedidos", version="1.0")
 
@@ -19,6 +20,7 @@ app.add_middleware(
 
 app.include_router(auth.router)
 app.include_router(pedidos.router)
+app.include_router(ui.router)
 
 @app.get("/")            # 👈 agrega esto
 def root():

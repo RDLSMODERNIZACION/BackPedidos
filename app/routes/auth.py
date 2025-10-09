@@ -7,12 +7,17 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 @router.post("/login", response_model=LoginOut)
 def login(body: LoginIn):
+    # Sin citext: comparamos en lower()
     sql = """
-    select pf.user_id::text, pf.nombre, pf.secretaria_id, s.nombre as secretaria
+    select
+      pf.user_id::text,
+      pf.nombre,
+      pf.secretaria_id,
+      s.nombre as secretaria
     from public.perfil pf
     left join public.secretaria s on s.id = pf.secretaria_id
     where pf.is_active = true
-      and pf.login_username = %s::citext
+      and lower(pf.login_username::text) = lower(%s)
       and pf.password_plain = %s
     limit 1;
     """

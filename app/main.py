@@ -2,8 +2,7 @@
 import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routes import auth, pedidos
-from app.routers import ui
+from app.routes import auth, pedidos, ui   # ✅ unificado en routes
 
 app = FastAPI(title="Dirac – Pedidos", version="1.0")
 
@@ -22,10 +21,10 @@ app.include_router(auth.router)
 app.include_router(pedidos.router)
 app.include_router(ui.router)
 
-@app.get("/")            # 👈 agrega esto
+@app.get("/")
 def root():
     return {"ok": True, "service": "Dirac – Pedidos API", "version": "1.0"}
 
-@app.get("/health")      # ya lo tenías, lo dejamos
+@app.get("/health")
 def health():
     return {"ok": True}

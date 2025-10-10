@@ -1,14 +1,19 @@
 # routes/ui.py
-from fastapi import APIRouter, HTTPException, Query, Header
+from fastapi import APIRouter, HTTPException, Query, Header, UploadFile, File
 from pydantic import BaseModel
 from typing import Optional, Literal, Dict, Any, List
 from psycopg.rows import dict_row
 from psycopg.errors import OperationalError, DatabaseError
 from decimal import Decimal
 import time
+import os
+import shutil
+
 from app.db import get_conn
 
 router = APIRouter(prefix="/ui", tags=["ui"])
+
+FILES_DIR = os.getenv("FILES_DIR", "files")
 
 # =========================
 # Listado (ya existente)
@@ -243,3 +248,93 @@ def ui_pedidos_set_estado(
 
     except (OperationalError, DatabaseError) as e:
         raise HTTPException(status_code=500, detail=f"Error actualizando estado: {e}")
+
+# =========================
+# Archivos (NUEVO)
+# =========================
+
+def _pedido_estado(conn, pedido_id: int) -> str:
+    with conn.cursor(row_factory=dict_row) as cur:
+        # Tu FK referencia public.pedido (singular)
+        cur.execute("SELECT estado FROM public.pedido WHERE id = %s", (pedido_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Pedido no encontrado")
+        return row["estado"]
+
+@router.get("/pedidos/{pedido_id}/archivos")
+def ui_pedido_list_archivos(pedido_id: int) -> List[Dict[str, Any]]:
+    """
+    Lista archivos del pedido desde public.pedido_archivo, con alias para el front.
+    """
+    try:
+        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("""
+                SELECT
+                  id,
+                  tipo_doc      AS kind,
+                  file_name     AS filename,
+                  content_type,
+                  bytes         AS size_bytes,
+                  storage_path  AS url,
+                  created_at    AS uploaded_at
+                FROM public.pedido_archivo
+               WHERE pedido_id = %s
+               ORDER BY created_at DESC
+            """, (pedido_id,))
+            return cur.fetchall()
+    except (OperationalError, DatabaseError) as e:
+        raise HTTPException(status_code=500, detail=f"Error listando archivos: {e}")
+
+@router.post("/pedidos/{pedido_id}/archivo/formal")
+def ui_pedido_upload_formal(pedido_id: int, pdf: UploadFile = File(...)) -> Dict[str, Any]:
+    """
+    Sube/reescribe el PDF formal firmado (tipo_doc='formal_pdf') usando public.pedido_archivo.
+    Requiere que el pedido esté EN estado 'aprobado'.
+    Guarda el archivo en {FILES_DIR}/pedidos/<id>/formal.pdf y hace UPSERT contra (pedido_id, tipo_doc).
+    """
+    if pdf.content_type not in ("application/pdf",):
+        raise HTTPException(status_code=415, detail="Sólo se acepta PDF")
+
+    try:
+        with get_conn() as conn:
+            estado = _pedido_estado(conn, pedido_id)
+            if estado != "aprobado":
+                raise HTTPException(status_code=409, detail=f"El pedido no está aprobado (estado actual: {estado})")
+
+            # Guardar en disco
+            pedido_dir = os.path.join(FILES_DIR, "pedidos", str(pedido_id))
+            os.makedirs(pedido_dir, exist_ok=True)
+            dest_path = os.path.join(pedido_dir, "formal.pdf")
+            with open(dest_path, "wb") as out:
+                shutil.copyfileobj(pdf.file, out)
+
+            url = f"/files/pedidos/{pedido_id}/formal.pdf"
+            size = os.path.getsize(dest_path)
+
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("""
+                    INSERT INTO public.pedido_archivo
+                        (pedido_id, storage_path, file_name, content_type, bytes, tipo_doc)
+                    VALUES (%s, %s, %s, %s, %s, 'formal_pdf')
+                    ON CONFLICT (pedido_id, tipo_doc)
+                    DO UPDATE SET
+                        storage_path = EXCLUDED.storage_path,
+                        file_name    = EXCLUDED.file_name,
+                        content_type = EXCLUDED.content_type,
+                        bytes        = EXCLUDED.bytes,
+                        created_at   = NOW()
+                    RETURNING
+                      id,
+                      tipo_doc      AS kind,
+                      file_name     AS filename,
+                      content_type,
+                      bytes         AS size_bytes,
+                      storage_path  AS url,
+                      created_at    AS uploaded_at
+                """, (pedido_id, url, pdf.filename, pdf.content_type, size))
+                row = cur.fetchone()
+                conn.commit()
+                return row
+    except (OperationalError, DatabaseError) as e:
+        raise HTTPException(status_code=500, detail=f"Error subiendo formal.pdf: {e}")

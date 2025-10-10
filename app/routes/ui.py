@@ -16,7 +16,7 @@ router = APIRouter(prefix="/ui", tags=["ui"])
 FILES_DIR = os.getenv("FILES_DIR", "files")
 
 # =========================
-# Listado (ya existente)
+# Listado
 # =========================
 
 SortParam = Literal[
@@ -44,7 +44,10 @@ def ui_pedidos_list(
     modulo: Optional[str] = Query(None),
     sort: SortParam = Query("updated_at_desc"),
 ) -> Dict[str, Any]:
-    # WHERE dinámico (solo columnas que EXISTEN en tu vista actual)
+    """
+    Listado SIN dependencia de vistas. Detecta 'modulo' por existencia en tablas
+    y calcula 'total' con suma de items de adquisición (o presupuesto_estimado).
+    """
     wh: List[str] = []
     params: Dict[str, Any] = {"limit": limit, "offset": offset}
 
@@ -68,26 +71,43 @@ def ui_pedidos_list(
     where_sql = "WHERE " + " AND ".join(wh) if wh else ""
     order_sql = _sort_sql(sort)
 
-    # UNA SOLA QUERY (datos + total con ventana) usando SOLO columnas existentes
     sql = f"""
+    WITH det AS (
       SELECT
-        id,
-        id_tramite,
-        modulo,
-        secretaria,
-        solicitante,
-        estado,
-        total,
-        creado,
-        updated_at,
-        COUNT(*) OVER() AS _total_count
-      FROM public.ui_pedidos_listado
+        p.id,
+        p.numero AS id_tramite,
+        CASE
+          WHEN EXISTS (SELECT 1 FROM public.pedido_servicios   ps  WHERE ps.pedido_id = p.id) THEN 'servicios'
+          WHEN EXISTS (SELECT 1 FROM public.pedido_alquiler    pa  WHERE pa.pedido_id = p.id) THEN 'alquiler'
+          WHEN EXISTS (SELECT 1 FROM public.pedido_adquisicion pad WHERE pad.pedido_id = p.id) THEN 'adquisicion'
+          WHEN EXISTS (SELECT 1 FROM public.pedido_reparacion  pr  WHERE pr.pedido_id = p.id) THEN 'reparacion'
+          ELSE NULL
+        END AS modulo,
+        s.nombre AS secretaria,
+        COALESCE(perf.nombre, perf.login_username) AS solicitante,
+        p.estado,
+        COALESCE(
+          (SELECT SUM(COALESCE(ai.total, ai.cantidad * COALESCE(ai.precio_unitario, 0)))
+             FROM public.pedido_adquisicion_item ai
+            WHERE ai.pedido_id = p.id),
+          p.presupuesto_estimado
+        ) AS total,
+        p.created_at AS creado,
+        p.updated_at
+      FROM public.pedido p
+      JOIN public.secretaria s ON s.id = p.secretaria_id
+      LEFT JOIN public.perfil perf ON perf.user_id = p.created_by
+    )
+    SELECT *
+      FROM (
+        SELECT det.*, COUNT(*) OVER() AS _total_count
+          FROM det
+      ) x
       {where_sql}
       {order_sql}
       LIMIT %(limit)s OFFSET %(offset)s
     """
 
-    # Retry corto por si la conexión se cerró (Render + libpq)
     for attempt in (1, 2):
         try:
             with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -112,15 +132,163 @@ def ui_pedidos_list(
             raise HTTPException(status_code=500, detail=f"Error listando pedidos: {e}")
 
 # =========================
-# Cambio de estado (NUEVO)
+# Detalle (para pestaña Info)
 # =========================
 
-# Sólo estas dos acciones, según tu pedido:
+@router.get("/pedidos/{pedido_id}")
+def ui_pedido_detalle(pedido_id: int) -> Dict[str, Any]:
+    """
+    Devuelve generales + ambiente + módulo del pedido.
+    Estructura:
+    {
+      id, numero, estado, secretaria, solicitante, creado,
+      fecha_pedido, fecha_desde, fecha_hasta, presupuesto_estimado, observaciones,
+      ambito: { tipo: "obra"|"mantenimientodeescuelas"|"ninguno", obra?, escuelas? },
+      modulo: { tipo: "servicios"|"alquiler"|"adquisicion"|"reparacion", ... } | null
+    }
+    """
+    try:
+        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+            # Generales
+            cur.execute("""
+                SELECT
+                  p.id, p.numero, p.estado,
+                  p.fecha_pedido, p.fecha_desde, p.fecha_hasta,
+                  p.presupuesto_estimado, p.observaciones,
+                  p.created_at AS creado,
+                  s.nombre AS secretaria,
+                  perf.nombre AS solicitante
+                FROM public.pedido p
+                JOIN public.secretaria s ON s.id = p.secretaria_id
+                LEFT JOIN public.perfil perf ON perf.user_id = p.created_by
+                WHERE p.id = %s
+            """, (pedido_id,))
+            base = cur.fetchone()
+            if not base:
+                raise HTTPException(status_code=404, detail="Pedido no encontrado")
+
+            out: Dict[str, Any] = { **base, "ambito": None, "modulo": None }
+
+            # Ámbito
+            cur.execute("SELECT tipo::text AS tipo_db FROM public.pedido_ambito WHERE pedido_id=%s", (pedido_id,))
+            amb = cur.fetchone()
+            tipo_db = (amb or {}).get("tipo_db", "general")
+
+            if tipo_db == "obra":
+                cur.execute("""
+                    SELECT nombre_obra, ubicacion, detalle, presupuesto_obra,
+                           fecha_inicio, fecha_fin, es_nueva, obra_existente_ref
+                      FROM public.ambito_obra
+                     WHERE pedido_id=%s
+                """, (pedido_id,))
+                r = cur.fetchone() or {}
+                out["ambito"] = {
+                    "tipo": "obra",
+                    "obra": {
+                        "obra_nombre": r.get("nombre_obra"),
+                        "ubicacion": r.get("ubicacion"),
+                        "detalle": r.get("detalle"),
+                        "presupuesto_obra": r.get("presupuesto_obra"),
+                        "fecha_inicio": r.get("fecha_inicio"),
+                        "fecha_fin": r.get("fecha_fin"),
+                        "es_nueva": r.get("es_nueva"),
+                        "obra_existente_ref": r.get("obra_existente_ref"),
+                    }
+                }
+            elif tipo_db == "mant_escuela":
+                cur.execute("""
+                    SELECT escuela, ubicacion, necesidad, fecha_desde, fecha_hasta, detalle
+                      FROM public.ambito_mant_escuela
+                     WHERE pedido_id=%s
+                """, (pedido_id,))
+                r = cur.fetchone() or {}
+                out["ambito"] = {
+                    "tipo": "mantenimientodeescuelas",
+                    "escuelas": {
+                        "escuela": r.get("escuela"),
+                        "ubicacion": r.get("ubicacion"),
+                        "necesidad": r.get("necesidad"),
+                        "fecha_desde": r.get("fecha_desde"),
+                        "fecha_hasta": r.get("fecha_hasta"),
+                        "detalle": r.get("detalle"),
+                    }
+                }
+            else:
+                out["ambito"] = {"tipo": "ninguno"}
+
+            # Módulo (uno por pedido)
+            # Servicios
+            cur.execute("""
+                SELECT tipo_servicio, detalle_mantenimiento, tipo_profesional, dia_desde, dia_hasta
+                  FROM public.pedido_servicios
+                 WHERE pedido_id=%s
+            """, (pedido_id,))
+            r = cur.fetchone()
+            if r:
+                out["modulo"] = {"tipo": "servicios", **r}
+                return out
+
+            # Alquiler
+            cur.execute("""
+                SELECT categoria, uso_edificio, ubicacion_edificio,
+                       uso_maquinaria, tipo_maquinaria,
+                       requiere_combustible, requiere_chofer,
+                       cronograma_desde, cronograma_hasta, horas_por_dia,
+                       que_alquilar, detalle_uso
+                  FROM public.pedido_alquiler
+                 WHERE pedido_id=%s
+            """, (pedido_id,))
+            r = cur.fetchone()
+            if r:
+                out["modulo"] = {"tipo": "alquiler", **r}
+                return out
+
+            # Adquisición + items
+            cur.execute("""
+                SELECT proposito, modo_adquisicion
+                  FROM public.pedido_adquisicion
+                 WHERE pedido_id=%s
+            """, (pedido_id,))
+            head = cur.fetchone()
+            if head:
+                cur.execute("""
+                    SELECT descripcion, cantidad, unidad, precio_unitario, total
+                      FROM public.pedido_adquisicion_item
+                     WHERE pedido_id=%s
+                     ORDER BY id
+                """, (pedido_id,))
+                items = cur.fetchall()
+                out["modulo"] = {"tipo": "adquisicion", **head, "items": items}
+                return out
+
+            # Reparación
+            cur.execute("""
+                SELECT tipo_reparacion, unidad_reparar, que_reparar, detalle_reparacion
+                  FROM public.pedido_reparacion
+                 WHERE pedido_id=%s
+            """, (pedido_id,))
+            r = cur.fetchone()
+            if r:
+                out["modulo"] = {"tipo": "reparacion", **r}
+                return out
+
+            out["modulo"] = None
+            return out
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ui_pedido_detalle_error: {e}")
+
+# =========================
+# Cambio de estado
+# =========================
+
 EstadoNuevo = Literal["aprobado", "en_revision"]
 
 class EstadoIn(BaseModel):
     estado: EstadoNuevo
-    motivo: Optional[str] = None  # opcional, para auditoría
+    motivo: Optional[str] = None  # auditoría
 
 UMBRAL = Decimal(10_000_000)  # $10M
 
@@ -138,21 +306,12 @@ def _infer_role(nombre_secretaria: Optional[str]) -> str:
 def ui_pedidos_set_estado(
     pedido_id: int,
     body: EstadoIn,
-    # 👇 IMPORTANTE: sin convert_underscores=False para aceptar "X-User" y "X-Secretaria"
     x_user: Optional[str] = Header(default=None),
     x_secretaria: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
-    """
-    Cambia el estado del pedido en public.pedido y registra auditoría en public.pedido_historial.
-    Reglas de permisos:
-      - Economía (admin): puede todo.
-      - Área de Compras: sólo si presupuesto_estimado > $10M.
-      - Secretaría de Compras: sólo si presupuesto_estimado ≤ $10M.
-      - Resto de secretarías: sólo los propios (mismo nombre de secretaría).
-    """
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-            # 1) Tomar la fila con lock y traer info necesaria
+            # Fila con lock
             cur.execute(
                 """
                 SELECT p.id, p.numero, p.estado, p.presupuesto_estimado,
@@ -173,7 +332,7 @@ def ui_pedidos_set_estado(
             monto: Decimal = row["presupuesto_estimado"] or Decimal(0)
             sec_nombre: str = row["secretaria_nombre"]
 
-            # 2) Permisos (lado servidor)
+            # Permisos
             rol = _infer_role(x_secretaria)
             allowed = False
             if rol == "economia_admin":
@@ -183,7 +342,6 @@ def ui_pedidos_set_estado(
             elif rol == "secretaria_compras":
                 allowed = (monto <= UMBRAL)
             else:
-                # resto de secretarías: sólo los propios
                 if not x_secretaria:
                     raise HTTPException(status_code=403, detail="Falta X-Secretaria para validar permisos")
                 allowed = (x_secretaria.strip().upper() == (sec_nombre or "").strip().upper())
@@ -191,7 +349,7 @@ def ui_pedidos_set_estado(
             if not allowed:
                 raise HTTPException(status_code=403, detail="No tenés permisos para cambiar el estado de este pedido")
 
-            # 3) Idempotencia
+            # Idempotencia
             if estado_anterior == estado_nuevo:
                 return {
                     "ok": True,
@@ -203,7 +361,7 @@ def ui_pedidos_set_estado(
                     "message": "Sin cambios",
                 }
 
-            # 4) Actualizar el pedido
+            # Update
             cur.execute(
                 """
                 UPDATE public.pedido
@@ -218,7 +376,7 @@ def ui_pedidos_set_estado(
             if not upd:
                 raise HTTPException(status_code=500, detail="No se pudo actualizar el pedido")
 
-            # 5) Auditoría en historial
+            # Historial
             cur.execute(
                 """
                 INSERT INTO public.pedido_historial
@@ -235,7 +393,6 @@ def ui_pedidos_set_estado(
                 )
             )
 
-            # commit implícito al salir del with
             return {
                 "ok": True,
                 "id": pedido_id,
@@ -250,12 +407,11 @@ def ui_pedidos_set_estado(
         raise HTTPException(status_code=500, detail=f"Error actualizando estado: {e}")
 
 # =========================
-# Archivos (NUEVO)
+# Archivos
 # =========================
 
 def _pedido_estado(conn, pedido_id: int) -> str:
     with conn.cursor(row_factory=dict_row) as cur:
-        # Tu FK referencia public.pedido (singular)
         cur.execute("SELECT estado FROM public.pedido WHERE id = %s", (pedido_id,))
         row = cur.fetchone()
         if not row:
@@ -264,9 +420,6 @@ def _pedido_estado(conn, pedido_id: int) -> str:
 
 @router.get("/pedidos/{pedido_id}/archivos")
 def ui_pedido_list_archivos(pedido_id: int) -> List[Dict[str, Any]]:
-    """
-    Lista archivos del pedido desde public.pedido_archivo, con alias para el front.
-    """
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
@@ -289,7 +442,7 @@ def ui_pedido_list_archivos(pedido_id: int) -> List[Dict[str, Any]]:
 @router.post("/pedidos/{pedido_id}/archivo/formal")
 def ui_pedido_upload_formal(pedido_id: int, pdf: UploadFile = File(...)) -> Dict[str, Any]:
     """
-    Sube/reescribe el PDF formal firmado (tipo_doc='formal_pdf') usando public.pedido_archivo.
+    Sube/reescribe el PDF formal firmado (tipo_doc='formal_pdf').
     Requiere que el pedido esté EN estado 'aprobado'.
     Guarda el archivo en {FILES_DIR}/pedidos/<id>/formal.pdf y hace UPSERT contra (pedido_id, tipo_doc).
     """
@@ -302,7 +455,7 @@ def ui_pedido_upload_formal(pedido_id: int, pdf: UploadFile = File(...)) -> Dict
             if estado != "aprobado":
                 raise HTTPException(status_code=409, detail=f"El pedido no está aprobado (estado actual: {estado})")
 
-            # Guardar en disco
+            # Guardado en disco
             pedido_dir = os.path.join(FILES_DIR, "pedidos", str(pedido_id))
             os.makedirs(pedido_dir, exist_ok=True)
             dest_path = os.path.join(pedido_dir, "formal.pdf")

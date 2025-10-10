@@ -104,95 +104,74 @@ def create_pedido_full(payload: PedidoCreate) -> Dict[str, Any]:
     a = payload.ambito
     m = payload.modulo
 
-    # Validación simple: un solo módulo permitido (ya lo asegura DB, pero avisamos bonito)
-    # (La unión de Pydantic ya garantiza que venga solo uno)
-    if a.tipo == "obra" and not a.obra:
+    # --- Mapeo UI -> enum DB ---
+    # UI: 'ninguno' | 'obra' | 'mantenimientodeescuelas'
+    # DB: 'general' | 'obra' | 'mant_escuela'
+    MAP_AMBITO = {
+        "ninguno": "general",
+        "obra": "obra",
+        "mantenimientodeescuelas": "mant_escuela",
+    }
+    tipo_ui = a.tipo
+    tipo_db = MAP_AMBITO.get(tipo_ui)
+    if tipo_db is None:
+        raise HTTPException(status_code=422, detail=f"Ambito inválido: {tipo_ui}")
+
+    # Validaciones de consistencia según tipo_ui (no tipo_db)
+    if tipo_ui == "obra" and not a.obra:
         raise HTTPException(status_code=400, detail="Falta 'ambito.obra' para tipo=obra.")
-    if a.tipo == "mantenimientodeescuelas" and not a.escuelas:
+    if tipo_ui == "mantenimientodeescuelas" and not a.escuelas:
         raise HTTPException(status_code=400, detail="Falta 'ambito.escuelas' para tipo=mantenimientodeescuelas.")
 
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
             # 1) Secretaria
-            sec_id = _lookup_secretaria_id(cur, g.secretaria)
+            cur.execute("SELECT id FROM public.secretaria WHERE nombre=%s", (g.secretaria,))
+            row_sec = cur.fetchone()
+            if not row_sec:
+                raise HTTPException(status_code=400, detail=f"Secretaría no encontrada: {g.secretaria}")
+            sec_id = row_sec["id"]
 
-            # 2) Encabezado pedido
+            # 2) Pedido header (coalesce fecha_pedido si viene None)
             cur.execute("""
-                INSERT INTO public.pedido (secretaria_id, estado, fecha_pedido, fecha_desde, fecha_hasta,
-                                           presupuesto_estimado, observaciones, created_by)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,
-                        (SELECT user_id FROM public.perfil WHERE login_username=%s LIMIT 1))
+                INSERT INTO public.pedido (
+                  secretaria_id, estado, fecha_pedido, fecha_desde, fecha_hasta,
+                  presupuesto_estimado, observaciones, created_by
+                )
+                VALUES (
+                  %s, %s,
+                  COALESCE(%s, CURRENT_DATE),
+                  %s, %s,
+                  %s, %s,
+                  (SELECT user_id FROM public.perfil WHERE login_username=%s LIMIT 1)
+                )
                 RETURNING id, numero, created_at, updated_at
-            """, (sec_id, g.estado, g.fecha_pedido, g.fecha_desde, g.fecha_hasta,
-                  g.presupuesto_estimado, g.observaciones, g.created_by_username))
+            """, (
+                sec_id, g.estado, g.fecha_pedido, g.fecha_desde, g.fecha_hasta,
+                g.presupuesto_estimado, g.observaciones, g.created_by_username
+            ))
             ped = cur.fetchone()
             pedido_id = ped["id"]
 
-            # 3) ÁMBITO
-            if a.tipo not in ("ninguno", "obra", "mantenimientodeescuelas"):
-                raise HTTPException(status_code=400, detail="Ambito no válido.")
-
+            # 3) ÁMBITO (usar tipo_db para el enum)
             cur.execute("""
                 INSERT INTO public.pedido_ambito (pedido_id, tipo)
                 VALUES (%s, %s)
-            """, (pedido_id, a.tipo))
+            """, (pedido_id, tipo_db))
 
-            if a.tipo == "obra":
+            if tipo_ui == "obra":
                 cur.execute("""
                   INSERT INTO public.ambito_obra (pedido_id, nombre_obra)
                   VALUES (%s, %s)
                 """, (pedido_id, a.obra.obra_nombre))
-            elif a.tipo == "mantenimientodeescuelas":
+            elif tipo_ui == "mantenimientodeescuelas":
                 cur.execute("""
                   INSERT INTO public.ambito_mant_escuela (pedido_id, escuela)
                   VALUES (%s, %s)
                 """, (pedido_id, a.escuelas.escuela))
 
-            # 4) MÓDULO (exclusivo)
-            if m.tipo == "servicios":
-                cur.execute("""
-                  INSERT INTO public.pedido_servicios (pedido_id, tipo_servicio, detalle_mantenimiento,
-                                                       tipo_profesional, dia_desde, dia_hasta)
-                  VALUES (%s,%s,%s,%s,%s,%s)
-                """, (pedido_id, m.tipo_servicio, m.detalle_mantenimiento,
-                      m.tipo_profesional, m.dia_desde, m.dia_hasta))
-
-            elif m.tipo == "alquiler":
-                cur.execute("""
-                  INSERT INTO public.pedido_alquiler (pedido_id, categoria, uso_edificio, ubicacion_edificio,
-                                                      uso_maquinaria, tipo_maquinaria, requiere_combustible,
-                                                      requiere_chofer, cronograma_desde, cronograma_hasta,
-                                                      horas_por_dia, que_alquilar, detalle_uso)
-                  VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """, (pedido_id, m.categoria, m.uso_edificio, m.ubicacion_edificio,
-                      m.uso_maquinaria, m.tipo_maquinaria, m.requiere_combustible,
-                      m.requiere_chofer, m.cronograma_desde, m.cronograma_hasta,
-                      m.horas_por_dia, m.que_alquilar, m.detalle_uso))
-
-            elif m.tipo == "adquisicion":
-                cur.execute("""
-                  INSERT INTO public.pedido_adquisicion (pedido_id, proposito, modo_adquisicion)
-                  VALUES (%s,%s,%s)
-                """, (pedido_id, m.proposito, m.modo_adquisicion))
-                # Ítems
-                if m.items:
-                    cur.executemany("""
-                      INSERT INTO public.pedido_adquisicion_item
-                        (pedido_id, descripcion, cantidad, unidad, precio_unitario)
-                      VALUES (%s,%s,%s,%s,%s)
-                    """, [(pedido_id, it.descripcion, it.cantidad, it.unidad, it.precio_unitario)
-                          for it in m.items])
-
-            elif m.tipo == "reparacion":
-                cur.execute("""
-                  INSERT INTO public.pedido_reparacion (pedido_id, tipo_reparacion, unidad_reparar,
-                                                        que_reparar, detalle_reparacion)
-                  VALUES (%s,%s,%s,%s,%s)
-                """, (pedido_id, m.tipo_reparacion, m.unidad_reparar,
-                      m.que_reparar, m.detalle_reparacion))
-
-            else:
-                raise HTTPException(status_code=400, detail="Módulo no reconocido.")
+            # 4) MÓDULO (igual que ya tenías)
+            # ... (deja tu código de inserción para servicios/alquiler/adquisición/reparación) ...
 
             return {
                 "ok": True,

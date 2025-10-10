@@ -33,7 +33,7 @@ def ui_pedidos_list(
     modulo: Optional[str] = Query(None),
     sort: SortParam = Query("updated_at_desc"),
 ) -> Dict[str, Any]:
-    # WHERE dinámico
+    # WHERE dinámico (solo columnas que EXISTEN en tu vista actual)
     wh: List[str] = []
     params: Dict[str, Any] = {"limit": limit, "offset": offset}
 
@@ -50,35 +50,39 @@ def ui_pedidos_list(
            id_tramite ILIKE %(q)s OR
            modulo ILIKE %(q)s OR
            secretaria ILIKE %(q)s OR
-           COALESCE(solicitante,'') ILIKE %(q)s OR
-           COALESCE(observaciones,'') ILIKE %(q)s OR
-           COALESCE(tipo_ambito,'') ILIKE %(q)s
+           COALESCE(solicitante,'') ILIKE %(q)s
         )""")
         params["q"] = f"%{q}%"
 
     where_sql = "WHERE " + " AND ".join(wh) if wh else ""
     order_sql = _sort_sql(sort)
 
-    # UNA SOLA QUERY: datos + total_count con window
+    # UNA SOLA QUERY (datos + total con ventana) usando SOLO columnas existentes
     sql = f"""
-      SELECT id, id_tramite, modulo, secretaria, solicitante, estado, total,
-             observaciones, creado, updated_at, tipo_ambito,
-             has_presupuesto_1, has_presupuesto_2, has_anexo1_obra,
-             COUNT(*) OVER() AS _total_count
+      SELECT
+        id,
+        id_tramite,
+        modulo,
+        secretaria,
+        solicitante,
+        estado,
+        total,
+        creado,
+        updated_at,
+        COUNT(*) OVER() AS _total_count
       FROM public.ui_pedidos_listado
       {where_sql}
       {order_sql}
       LIMIT %(limit)s OFFSET %(offset)s
     """
 
-    # Retry básico si la conexión se cerró inesperadamente
+    # Retry corto por si la conexión se cerró (Render + libpq)
     for attempt in (1, 2):
         try:
             with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
                 total = rows[0]["_total_count"] if rows else 0
-                # limpiamos el campo auxiliar
                 for r in rows:
                     r.pop("_total_count", None)
                 return {
@@ -92,6 +96,6 @@ def ui_pedidos_list(
         except (OperationalError, DatabaseError) as e:
             msg = str(e)
             if "server closed the connection unexpectedly" in msg and attempt == 1:
-                time.sleep(0.3)  # breve espera y reintento
+                time.sleep(0.3)
                 continue
             raise HTTPException(status_code=500, detail=f"Error listando pedidos: {e}")

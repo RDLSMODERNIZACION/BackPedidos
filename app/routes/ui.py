@@ -133,8 +133,9 @@ def _infer_role(nombre_secretaria: Optional[str]) -> str:
 def ui_pedidos_set_estado(
     pedido_id: int,
     body: EstadoIn,
-    x_user: Optional[str] = Header(default=None, convert_underscores=False),
-    x_secretaria: Optional[str] = Header(default=None, convert_underscores=False),
+    # 👇 IMPORTANTE: sin convert_underscores=False para aceptar "X-User" y "X-Secretaria"
+    x_user: Optional[str] = Header(default=None),
+    x_secretaria: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     """
     Cambia el estado del pedido en public.pedido y registra auditoría en public.pedido_historial.

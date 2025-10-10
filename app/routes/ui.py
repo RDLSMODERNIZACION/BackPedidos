@@ -1,12 +1,18 @@
 # routes/ui.py
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Header
+from pydantic import BaseModel
 from typing import Optional, Literal, Dict, Any, List
 from psycopg.rows import dict_row
 from psycopg.errors import OperationalError, DatabaseError
+from decimal import Decimal
 import time
 from app.db import get_conn
 
 router = APIRouter(prefix="/ui", tags=["ui"])
+
+# =========================
+# Listado (ya existente)
+# =========================
 
 SortParam = Literal[
     "updated_at_desc", "updated_at_asc",
@@ -99,3 +105,140 @@ def ui_pedidos_list(
                 time.sleep(0.3)
                 continue
             raise HTTPException(status_code=500, detail=f"Error listando pedidos: {e}")
+
+# =========================
+# Cambio de estado (NUEVO)
+# =========================
+
+# Sólo estas dos acciones, según tu pedido:
+EstadoNuevo = Literal["aprobado", "en_revision"]
+
+class EstadoIn(BaseModel):
+    estado: EstadoNuevo
+    motivo: Optional[str] = None  # opcional, para auditoría
+
+UMBRAL = Decimal(10_000_000)  # $10M
+
+def _infer_role(nombre_secretaria: Optional[str]) -> str:
+    s = (nombre_secretaria or "").upper()
+    if "ECONOM" in s:  # Secretaría de Economía
+        return "economia_admin"
+    if "ÁREA DE COMPRAS" in s or "AREA DE COMPRAS" in s:
+        return "area_compras"
+    if "SECRETARÍA DE COMPRAS" in s or "SECRETARIA DE COMPRAS" in s:
+        return "secretaria_compras"
+    return "secretaria"
+
+@router.post("/pedidos/{pedido_id}/estado")
+def ui_pedidos_set_estado(
+    pedido_id: int,
+    body: EstadoIn,
+    x_user: Optional[str] = Header(default=None, convert_underscores=False),
+    x_secretaria: Optional[str] = Header(default=None, convert_underscores=False),
+) -> Dict[str, Any]:
+    """
+    Cambia el estado del pedido en public.pedido y registra auditoría en public.pedido_historial.
+    Reglas de permisos:
+      - Economía (admin): puede todo.
+      - Área de Compras: sólo si presupuesto_estimado > $10M.
+      - Secretaría de Compras: sólo si presupuesto_estimado ≤ $10M.
+      - Resto de secretarías: sólo los propios (mismo nombre de secretaría).
+    """
+    try:
+        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+            # 1) Tomar la fila con lock y traer info necesaria
+            cur.execute(
+                """
+                SELECT p.id, p.numero, p.estado, p.presupuesto_estimado,
+                       p.secretaria_id, s.nombre AS secretaria_nombre
+                  FROM public.pedido p
+                  JOIN public.secretaria s ON s.id = p.secretaria_id
+                 WHERE p.id = %s
+                 FOR UPDATE
+                """,
+                (pedido_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Pedido no encontrado")
+
+            estado_anterior = row["estado"]
+            estado_nuevo = body.estado
+            monto: Decimal = row["presupuesto_estimado"] or Decimal(0)
+            sec_nombre: str = row["secretaria_nombre"]
+
+            # 2) Permisos (lado servidor)
+            rol = _infer_role(x_secretaria)
+            allowed = False
+            if rol == "economia_admin":
+                allowed = True
+            elif rol == "area_compras":
+                allowed = (monto > UMBRAL)
+            elif rol == "secretaria_compras":
+                allowed = (monto <= UMBRAL)
+            else:
+                # resto de secretarías: sólo los propios
+                if not x_secretaria:
+                    raise HTTPException(status_code=403, detail="Falta X-Secretaria para validar permisos")
+                allowed = (x_secretaria.strip().upper() == (sec_nombre or "").strip().upper())
+
+            if not allowed:
+                raise HTTPException(status_code=403, detail="No tenés permisos para cambiar el estado de este pedido")
+
+            # 3) Idempotencia
+            if estado_anterior == estado_nuevo:
+                return {
+                    "ok": True,
+                    "id": pedido_id,
+                    "numero": row["numero"],
+                    "estado": estado_nuevo,
+                    "previous": estado_anterior,
+                    "updated": False,
+                    "message": "Sin cambios",
+                }
+
+            # 4) Actualizar el pedido
+            cur.execute(
+                """
+                UPDATE public.pedido
+                   SET estado = %s,
+                       updated_at = NOW()
+                 WHERE id = %s
+             RETURNING updated_at
+                """,
+                (estado_nuevo, pedido_id)
+            )
+            upd = cur.fetchone()
+            if not upd:
+                raise HTTPException(status_code=500, detail="No se pudo actualizar el pedido")
+
+            # 5) Auditoría en historial
+            cur.execute(
+                """
+                INSERT INTO public.pedido_historial
+                    (pedido_id, estado_anterior, estado_nuevo, motivo, changed_by)
+                VALUES
+                    (%s,        %s,              %s,           %s,     %s)
+                """,
+                (
+                    pedido_id,
+                    estado_anterior,
+                    estado_nuevo,
+                    body.motivo,
+                    x_user or "ui",
+                )
+            )
+
+            # commit implícito al salir del with
+            return {
+                "ok": True,
+                "id": pedido_id,
+                "numero": row["numero"],
+                "estado": estado_nuevo,
+                "previous": estado_anterior,
+                "updated": True,
+                "updated_at": upd["updated_at"],
+            }
+
+    except (OperationalError, DatabaseError) as e:
+        raise HTTPException(status_code=500, detail=f"Error actualizando estado: {e}")

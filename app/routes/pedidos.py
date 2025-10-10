@@ -1,213 +1,191 @@
-# app/routes/pedidos.py
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
-from pydantic import BaseModel, Field
-from typing import Optional, Literal, List, Union, Dict, Any
+# app/routes/ui.py
+from fastapi import APIRouter, HTTPException
 from psycopg.rows import dict_row
+from typing import Any, Dict
 from app.db import get_conn
-from datetime import date
 
-router = APIRouter(prefix="/pedidos", tags=["pedidos"])
+router = APIRouter(prefix="/ui", tags=["ui"])
 
-# ------------- Pydantic In -------------
-
-class GeneralIn(BaseModel):
-    secretaria: str
-    estado: Literal["borrador","enviado","en_revision","aprobado","rechazado","cerrado"] = "enviado"
-    fecha_pedido: Optional[date] = None
-    fecha_desde: Optional[date] = None
-    fecha_hasta: Optional[date] = None
-    presupuesto_estimado: Optional[float] = None
-    observaciones: Optional[str] = None
-    created_by_username: Optional[str] = None  # opcional, si querés registrar autor
-
-# Ámbitos
-AmbitoTipo = Literal["ninguno","obra","mantenimientodeescuelas"]
-
-class AmbitoObraIn(BaseModel):
-    obra_nombre: str = Field(..., description="Nombre de la obra (Obra)")
-
-class AmbitoEscuelaIn(BaseModel):
-    escuela: str = Field(..., description="Nombre de la escuela (Mantenimiento de Escuelas)")
-
-class AmbitoIn(BaseModel):
-    tipo: AmbitoTipo
-    obra: Optional[AmbitoObraIn] = None
-    escuelas: Optional[AmbitoEscuelaIn] = None  # 'escuelas' para no chocar con palabra reservada
-
-# Módulos
-class ServiciosIn(BaseModel):
-    tipo: Literal["servicios"]
-    tipo_servicio: Literal["mantenimiento","profesionales"]
-    detalle_mantenimiento: Optional[str] = None
-    tipo_profesional: Optional[str] = None
-    dia_desde: Optional[date] = None
-    dia_hasta: Optional[date] = None
-
-class AlquilerIn(BaseModel):
-    tipo: Literal["alquiler"]
-    categoria: Literal["edificio","maquinaria","otros"]
-    uso_edificio: Optional[str] = None
-    ubicacion_edificio: Optional[str] = None
-    uso_maquinaria: Optional[str] = None
-    tipo_maquinaria: Optional[str] = None
-    requiere_combustible: Optional[bool] = None
-    requiere_chofer: Optional[bool] = None
-    cronograma_desde: Optional[date] = None
-    cronograma_hasta: Optional[date] = None
-    horas_por_dia: Optional[float] = None
-    que_alquilar: Optional[str] = None
-    detalle_uso: Optional[str] = None
-
-class AdqItemIn(BaseModel):
-    descripcion: str
-    cantidad: float = 1
-    unidad: Optional[str] = None
-    precio_unitario: Optional[float] = None
-
-class AdquisicionIn(BaseModel):
-    tipo: Literal["adquisicion"]
-    proposito: Optional[str] = None
-    modo_adquisicion: Literal["uno","muchos"] = "uno"
-    items: List[AdqItemIn] = []
-
-class ReparacionIn(BaseModel):
-    tipo: Literal["reparacion"]
-    tipo_reparacion: Literal["maquinaria","otros"]
-    unidad_reparar: Optional[str] = None
-    que_reparar: Optional[str] = None
-    detalle_reparacion: Optional[str] = None
-
-ModuloIn = Union[ServiciosIn, AlquilerIn, AdquisicionIn, ReparacionIn]
-
-class PedidoCreate(BaseModel):
-    generales: GeneralIn
-    ambito: AmbitoIn
-    modulo: ModuloIn
-
-# ------------- Helpers -------------
-
-def _one_or_none(rows: list[dict]) -> Optional[dict]:
+def _one(rows: list[dict]) -> dict | None:
     return rows[0] if rows else None
 
-def _lookup_secretaria_id(cur, nombre: str) -> int:
-    cur.execute("SELECT id FROM public.secretaria WHERE nombre=%s", (nombre,))
-    row = _one_or_none(cur.fetchall())
-    if not row:
-        raise HTTPException(status_code=400, detail=f"Secretaría no encontrada: {nombre}")
-    return row["id"]
+def _map_ambito_db_to_ui(t: str | None) -> str:
+    # DB enum: 'general' | 'obra' | 'mant_escuela'
+    # UI:      'ninguno' | 'obra' | 'mantenimientodeescuelas'
+    if t == "obra":
+        return "obra"
+    if t == "mant_escuela":
+        return "mantenimientodeescuelas"
+    return "ninguno"
 
-# ------------- POST /pedidos -------------
-
-@router.post("", status_code=201)
-def create_pedido_full(payload: PedidoCreate) -> Dict[str, Any]:
-    g = payload.generales
-    a = payload.ambito
-    m = payload.modulo
-
-    # --- Mapeo UI -> enum DB ---
-    # UI: 'ninguno' | 'obra' | 'mantenimientodeescuelas'
-    # DB: 'general' | 'obra' | 'mant_escuela'
-    MAP_AMBITO = {
-        "ninguno": "general",
-        "obra": "obra",
-        "mantenimientodeescuelas": "mant_escuela",
+@router.get("/pedidos/{pedido_id}")
+def ui_pedido_detalle(pedido_id: int) -> Dict[str, Any]:
+    """
+    Devuelve generales + ambiente + módulo para un pedido.
+    Estructura:
+    {
+      id, numero, estado, secretaria, solicitante, creado,
+      fecha_pedido, fecha_desde, fecha_hasta, presupuesto_estimado, observaciones,
+      ambito: { tipo: "obra"|"mantenimientodeescuelas"|"ninguno", obra?: {...}, escuelas?: {...} },
+      modulo: { tipo: "servicios"|"alquiler"|"adquisicion"|"reparacion", ... } | null
     }
-    tipo_ui = a.tipo
-    tipo_db = MAP_AMBITO.get(tipo_ui)
-    if tipo_db is None:
-        raise HTTPException(status_code=422, detail=f"Ambito inválido: {tipo_ui}")
-
-    # Validaciones de consistencia según tipo_ui (no tipo_db)
-    if tipo_ui == "obra" and not a.obra:
-        raise HTTPException(status_code=400, detail="Falta 'ambito.obra' para tipo=obra.")
-    if tipo_ui == "mantenimientodeescuelas" and not a.escuelas:
-        raise HTTPException(status_code=400, detail="Falta 'ambito.escuelas' para tipo=mantenimientodeescuelas.")
-
+    """
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-            # 1) Secretaria
-            cur.execute("SELECT id FROM public.secretaria WHERE nombre=%s", (g.secretaria,))
-            row_sec = cur.fetchone()
-            if not row_sec:
-                raise HTTPException(status_code=400, detail=f"Secretaría no encontrada: {g.secretaria}")
-            sec_id = row_sec["id"]
-
-            # 2) Pedido header (coalesce fecha_pedido si viene None)
+            # ---------- Generales ----------
             cur.execute("""
-                INSERT INTO public.pedido (
-                  secretaria_id, estado, fecha_pedido, fecha_desde, fecha_hasta,
-                  presupuesto_estimado, observaciones, created_by
-                )
-                VALUES (
-                  %s, %s,
-                  COALESCE(%s, CURRENT_DATE),
-                  %s, %s,
-                  %s, %s,
-                  (SELECT user_id FROM public.perfil WHERE login_username=%s LIMIT 1)
-                )
-                RETURNING id, numero, created_at, updated_at
-            """, (
-                sec_id, g.estado, g.fecha_pedido, g.fecha_desde, g.fecha_hasta,
-                g.presupuesto_estimado, g.observaciones, g.created_by_username
-            ))
-            ped = cur.fetchone()
-            pedido_id = ped["id"]
+                SELECT
+                  p.id,
+                  p.numero,
+                  p.estado,
+                  p.fecha_pedido,
+                  p.fecha_desde,
+                  p.fecha_hasta,
+                  p.presupuesto_estimado,
+                  p.observaciones,
+                  p.created_at AS creado,
+                  s.nombre     AS secretaria,
+                  pr.nombre    AS solicitante
+                FROM public.pedido p
+                JOIN public.secretaria s ON s.id = p.secretaria_id
+                LEFT JOIN public.perfil pr ON pr.user_id = p.created_by
+                WHERE p.id = %s
+            """, (pedido_id,))
+            base = _one(cur.fetchall())
+            if not base:
+                raise HTTPException(status_code=404, detail="Pedido no encontrado")
 
-            # 3) ÁMBITO (usar tipo_db para el enum)
+            out: Dict[str, Any] = {
+                **base,
+                "ambito": None,
+                "modulo": None,
+            }
+
+            # ---------- ÁMBITO ----------
             cur.execute("""
-                INSERT INTO public.pedido_ambito (pedido_id, tipo)
-                VALUES (%s, %s)
-            """, (pedido_id, tipo_db))
+                SELECT tipo::text AS tipo_db
+                FROM public.pedido_ambito
+                WHERE pedido_id = %s
+            """, (pedido_id,))
+            amb = _one(cur.fetchall())
+            tipo_ui = _map_ambito_db_to_ui(amb["tipo_db"] if amb else None)
 
             if tipo_ui == "obra":
                 cur.execute("""
-                  INSERT INTO public.ambito_obra (pedido_id, nombre_obra)
-                  VALUES (%s, %s)
-                """, (pedido_id, a.obra.obra_nombre))
+                    SELECT nombre_obra, ubicacion, detalle, presupuesto_obra,
+                           fecha_inicio, fecha_fin, es_nueva, obra_existente_ref
+                    FROM public.ambito_obra
+                    WHERE pedido_id = %s
+                """, (pedido_id,))
+                ao = _one(cur.fetchall()) or {}
+                out["ambito"] = {
+                    "tipo": "obra",
+                    "obra": {
+                        "obra_nombre": ao.get("nombre_obra"),
+                        "ubicacion": ao.get("ubicacion"),
+                        "detalle": ao.get("detalle"),
+                        "presupuesto_obra": ao.get("presupuesto_obra"),
+                        "fecha_inicio": ao.get("fecha_inicio"),
+                        "fecha_fin": ao.get("fecha_fin"),
+                        "es_nueva": ao.get("es_nueva"),
+                        "obra_existente_ref": ao.get("obra_existente_ref"),
+                    }
+                }
             elif tipo_ui == "mantenimientodeescuelas":
                 cur.execute("""
-                  INSERT INTO public.ambito_mant_escuela (pedido_id, escuela)
-                  VALUES (%s, %s)
-                """, (pedido_id, a.escuelas.escuela))
+                    SELECT escuela, ubicacion, necesidad, fecha_desde, fecha_hasta, detalle
+                    FROM public.ambito_mant_escuela
+                    WHERE pedido_id = %s
+                """, (pedido_id,))
+                am = _one(cur.fetchall()) or {}
+                out["ambito"] = {
+                    "tipo": "mantenimientodeescuelas",
+                    "escuelas": {
+                        "escuela": am.get("escuela"),
+                        "ubicacion": am.get("ubicacion"),
+                        "necesidad": am.get("necesidad"),
+                        "fecha_desde": am.get("fecha_desde"),
+                        "fecha_hasta": am.get("fecha_hasta"),
+                        "detalle": am.get("detalle"),
+                    }
+                }
+            else:
+                out["ambito"] = {"tipo": "ninguno"}
 
-            # 4) MÓDULO (igual que ya tenías)
-            # ... (deja tu código de inserción para servicios/alquiler/adquisición/reparación) ...
+            # ---------- MÓDULO ----------
+            # Servicios
+            cur.execute("""
+                SELECT tipo_servicio, detalle_mantenimiento, tipo_profesional, dia_desde, dia_hasta
+                FROM public.pedido_servicios
+                WHERE pedido_id = %s
+            """, (pedido_id,))
+            srv = _one(cur.fetchall())
+            if srv:
+                out["modulo"] = {
+                    "tipo": "servicios",
+                    **srv
+                }
+                return out  # corto aquí: sólo habrá un módulo por pedido
 
-            return {
-                "ok": True,
-                "pedido_id": pedido_id,
-                "numero": ped["numero"],
-                "created_at": ped["created_at"],
-            }
+            # Alquiler
+            cur.execute("""
+                SELECT categoria, uso_edificio, ubicacion_edificio,
+                       uso_maquinaria, tipo_maquinaria,
+                       requiere_combustible, requiere_chofer,
+                       cronograma_desde, cronograma_hasta, horas_por_dia,
+                       que_alquilar, detalle_uso
+                FROM public.pedido_alquiler
+                WHERE pedido_id = %s
+            """, (pedido_id,))
+            alq = _one(cur.fetchall())
+            if alq:
+                out["modulo"] = {
+                    "tipo": "alquiler",
+                    **alq
+                }
+                return out
+
+            # Adquisición + items
+            cur.execute("""
+                SELECT proposito, modo_adquisicion
+                FROM public.pedido_adquisicion
+                WHERE pedido_id = %s
+            """, (pedido_id,))
+            adq = _one(cur.fetchall())
+            if adq:
+                cur.execute("""
+                    SELECT descripcion, cantidad, unidad, precio_unitario, total
+                    FROM public.pedido_adquisicion_item
+                    WHERE pedido_id = %s
+                    ORDER BY id
+                """, (pedido_id,))
+                items = cur.fetchall()
+                out["modulo"] = {
+                    "tipo": "adquisicion",
+                    **adq,
+                    "items": items
+                }
+                return out
+
+            # Reparación
+            cur.execute("""
+                SELECT tipo_reparacion, unidad_reparar, que_reparar, detalle_reparacion
+                FROM public.pedido_reparacion
+                WHERE pedido_id = %s
+            """, (pedido_id,))
+            rep = _one(cur.fetchall())
+            if rep:
+                out["modulo"] = {
+                    "tipo": "reparacion",
+                    **rep
+                }
+                return out
+
+            # Si no hubo ningún módulo:
+            out["modulo"] = None
+            return out
+
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"create_error: {e}")
-
-# ------------- POST /pedidos/{id}/archivos/anexo1_obra -------------
-
-@router.post("/{pedido_id}/archivos/anexo1_obra")
-async def upload_anexo1_obra(pedido_id: int, file: UploadFile = File(...)):
-    # Validaciones mínimas
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="El anexo debe ser PDF.")
-    # Nota: acá iría tu subida a storage real (S3, Supabase, etc.)
-    storage_path = f"uploads/pedido_{pedido_id}/anexo1_obra.pdf"
-
-    try:
-        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("""
-              INSERT INTO public.pedido_archivo (pedido_id, storage_path, file_name, content_type, bytes, tipo_doc)
-              VALUES (%s,%s,%s,%s,%s,'anexo1_obra')
-              ON CONFLICT (pedido_id, tipo_doc) DO UPDATE
-                SET storage_path = EXCLUDED.storage_path,
-                    file_name    = EXCLUDED.file_name,
-                    content_type = EXCLUDED.content_type,
-                    bytes        = EXCLUDED.bytes,
-                    created_at   = now()
-              RETURNING id
-            """, (pedido_id, storage_path, file.filename, file.content_type or "application/pdf", 0))
-            row = cur.fetchone()
-            return {"ok": True, "archivo_id": row["id"], "storage_path": storage_path}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"upload_error: {e}")
+        raise HTTPException(status_code=500, detail=f"ui_pedido_detalle_error: {e}")

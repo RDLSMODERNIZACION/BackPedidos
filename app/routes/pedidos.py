@@ -1,5 +1,5 @@
 # app/routes/pedidos.py
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, UploadFile, File, Query
 from pydantic import BaseModel, Field
 from typing import Optional, Literal, List, Union, Dict, Any
 from psycopg.rows import dict_row
@@ -27,6 +27,7 @@ class AmbitoObraIn(BaseModel):
     obra_nombre: str = Field(..., description="Nombre de la obra (Obra)")
 
 class AmbitoEscuelaIn(BaseModel):
+    # Compat: por ahora seguimos recibiendo el nombre como texto
     escuela: str = Field(..., description="Nombre de la escuela (Mantenimiento de Escuelas)")
 
 class AmbitoIn(BaseModel):
@@ -96,6 +97,115 @@ def _lookup_secretaria_id(cur, nombre: str) -> int:
         raise HTTPException(status_code=400, detail=f"Secretaría no encontrada: {nombre}")
     return row["id"]
 
+# ========= Catálogo de Escuelas =========
+
+class EscuelaIn(BaseModel):
+    nombre: str = Field(..., min_length=2, description="Nombre visible de la escuela")
+    ubicacion: Optional[str] = None
+    activa: Optional[bool] = True
+
+def _ensure_catalog_table(cur) -> None:
+    """
+    Crea public.catalog_escuela si no existe (robusto para primeros despliegues).
+    """
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.catalog_escuela (
+          id         BIGSERIAL PRIMARY KEY,
+          nombre     TEXT NOT NULL UNIQUE,
+          ubicacion  TEXT,
+          activa     BOOLEAN NOT NULL DEFAULT TRUE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_catalog_escuela_nombre
+            ON public.catalog_escuela (nombre);
+    """)
+
+@router.get("/catalogo/escuelas")
+def catalogo_escuelas(
+    q: Optional[str] = Query(None, description="Filtro por nombre"),
+    activa: Optional[bool] = Query(True, description="Sólo activas por defecto"),
+    limit: int = Query(500, ge=1, le=5000),
+) -> List[Dict[str, Any]]:
+    """
+    Devuelve el catálogo de escuelas para un combo (id, nombre, ubicacion).
+    Si la tabla public.catalog_escuela no existe aún, hace fallback a un DISTINCT
+    sobre ambito_mant_escuela (sin IDs persistentes).
+    """
+    try:
+        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+            # Intento contra catálogo maestro
+            _ensure_catalog_table(cur)
+            where = []
+            params: Dict[str, Any] = {}
+            if q:
+                where.append("nombre ILIKE %(q)s")
+                params["q"] = f"%{q}%"
+            if activa is not None:
+                where.append("activa = %(activa)s")
+                params["activa"] = activa
+            where_sql = "WHERE " + " AND ".join(where) if where else ""
+            sql = f"""
+                SELECT id, nombre, ubicacion
+                  FROM public.catalog_escuela
+                  {where_sql}
+                 ORDER BY nombre ASC
+                 LIMIT {limit}
+            """
+            cur.execute(sql, params)
+            return cur.fetchall()
+    except Exception:
+        # Fallback si algo falla con catálogo
+        try:
+            with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur2:
+                if q:
+                    cur2.execute("""
+                        SELECT DISTINCT ON (TRIM(escuela)) NULL::BIGINT AS id,
+                               TRIM(escuela)                AS nombre,
+                               NULL::TEXT                   AS ubicacion
+                          FROM public.ambito_mant_escuela
+                         WHERE escuela ILIKE %s
+                         ORDER BY TRIM(escuela)
+                         LIMIT %s
+                    """, (f"%{q}%", limit))
+                else:
+                    cur2.execute("""
+                        SELECT DISTINCT ON (TRIM(escuela)) NULL::BIGINT AS id,
+                               TRIM(escuela)                AS nombre,
+                               NULL::TEXT                   AS ubicacion
+                          FROM public.ambito_mant_escuela
+                         ORDER BY TRIM(escuela)
+                         LIMIT %s
+                    """, (limit,))
+                return cur2.fetchall()
+        except Exception as e2:
+            raise HTTPException(status_code=500, detail=f"Error listando escuelas: {e2}")
+
+@router.post("/catalogo/escuelas", status_code=201)
+def catalogo_escuelas_create(body: EscuelaIn) -> Dict[str, Any]:
+    """
+    Crea o actualiza (upsert por nombre) una escuela en el catálogo.
+    Devuelve {id, nombre, ubicacion, activa}.
+    """
+    try:
+        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+            _ensure_catalog_table(cur)
+            cur.execute("""
+                INSERT INTO public.catalog_escuela (nombre, ubicacion, activa)
+                VALUES (%s, %s, COALESCE(%s, TRUE))
+                ON CONFLICT (nombre) DO UPDATE
+                   SET ubicacion = EXCLUDED.ubicacion,
+                       activa    = COALESCE(EXCLUDED.activa, public.catalog_escuela.activa),
+                       updated_at= now()
+                RETURNING id, nombre, ubicacion, activa
+            """, (body.nombre.strip(), (body.ubicacion or None), body.activa))
+            row = cur.fetchone()
+            return row
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creando escuela: {e}")
+
 # ------------- POST /pedidos -------------
 
 @router.post("", status_code=201)
@@ -126,11 +236,7 @@ def create_pedido_full(payload: PedidoCreate) -> Dict[str, Any]:
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
             # 1) Secretaria
-            cur.execute("SELECT id FROM public.secretaria WHERE nombre=%s", (g.secretaria,))
-            row_sec = cur.fetchone()
-            if not row_sec:
-                raise HTTPException(status_code=400, detail=f"Secretaría no encontrada: {g.secretaria}")
-            sec_id = row_sec["id"]
+            sec_id = _lookup_secretaria_id(cur, g.secretaria)
 
             # 2) Pedido header (coalesce fecha_pedido si viene None)
             cur.execute("""
@@ -165,6 +271,7 @@ def create_pedido_full(payload: PedidoCreate) -> Dict[str, Any]:
                   VALUES (%s, %s)
                 """, (pedido_id, a.obra.obra_nombre))
             elif tipo_ui == "mantenimientodeescuelas":
+                # Por compatibilidad: guardamos el nombre (hasta migrar a escuela_id)
                 cur.execute("""
                   INSERT INTO public.ambito_mant_escuela (pedido_id, escuela)
                   VALUES (%s, %s)

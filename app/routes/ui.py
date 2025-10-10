@@ -1,106 +1,93 @@
-# ============================
-# v_pedidos_list — listado y detalle
-# ============================
-from typing import List, Optional
-from fastapi import Query, HTTPException
+# routes/ui.py
+from fastapi import APIRouter, HTTPException, Query
+from typing import Optional, Literal, Dict, Any, List
 from psycopg.rows import dict_row
-from psycopg import Error as PsycopgError
 from app.db import get_conn
 
-@router.get("/pedidos/list", response_model=List[dict])
-def list_pedidos(
-    q: Optional[str] = Query(None, description="Busca en numero, secretaria o solicitante (ILIKE)"),
-    modulo: Optional[str] = Query(None, description="Filtro exacto por modulo (ej: servicios)"),
-    estado: Optional[str] = Query(None, description="Filtro exacto por estado (ej: enviado)"),
-    secretaria: Optional[str] = Query(None, description="Filtro exacto por secretaria"),
-    created_by: Optional[str] = Query(None, description="user_id creador"),
-    fecha_desde: Optional[str] = Query(None, description="YYYY-MM-DD (inclusive)"),
-    fecha_hasta: Optional[str] = Query(None, description="YYYY-MM-DD (inclusive)"),
-    min_total: Optional[float] = Query(None, ge=0),
-    max_total: Optional[float] = Query(None, ge=0),
-    order: str = Query(
-        "created_at_desc",
-        pattern="^(created_at_(asc|desc)|creado_(asc|desc)|fecha_pedido_(asc|desc)|numero_(asc|desc)|total_(asc|desc)|id_(asc|desc))$",
-    ),
-    limit: int = Query(100, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-):
-    base_sql = """
-        SELECT
-          id, numero, modulo, modulo_name, estado, estado_label, secretaria,
-          creado, created_by, solicitante, total, fecha_pedido,
-          presupuesto_estimado, created_at, updated_at
-        FROM public.v_pedidos_list
-    """
-    where, params = [], []
+router = APIRouter(prefix="/ui", tags=["ui"])
 
-    if q:
-        where.append("(numero ILIKE %s OR secretaria ILIKE %s OR solicitante ILIKE %s)")
-        like = f"%{q}%"
-        params.extend([like, like, like])
+SortParam = Literal[
+    "updated_at_desc", "updated_at_asc",
+    "created_at_desc", "created_at_asc",
+    "total_desc", "total_asc"
+]
+
+@router.get("/pedidos/list")
+def ui_pedidos_list(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    q: Optional[str] = Query(None, description="Búsqueda en id_tramite, secretaria, solicitante, módulo"),
+    estado: Optional[str] = Query(None, description="Filtra por estado exacto (borrador/enviado/en_revision/aprobado/rechazado/cerrado)"),
+    modulo: Optional[str] = Query(None, description="Filtra por módulo/ámbito (ILIKE)"),
+    sort: SortParam = Query("updated_at_desc")
+) -> Dict[str, Any]:
+    """
+    Lista de pedidos para la grilla del front:
+    - id, id_tramite (EXP-YYYY-####), modulo (o ámbito), secretaria, solicitante, estado, total, creado
+    - Paginación: limit + offset
+    - Filtros: q (texto), estado (exacto), modulo (ILIKE)
+    - Orden: updated/created/total asc/desc
+    """
+    # Mapeo de orden
+    sort_sql = {
+        "updated_at_desc": "ORDER BY updated_at DESC",
+        "updated_at_asc":  "ORDER BY updated_at ASC",
+        "created_at_desc": "ORDER BY creado DESC",
+        "created_at_asc":  "ORDER BY creado ASC",
+        "total_desc":      "ORDER BY total DESC NULLS LAST",
+        "total_asc":       "ORDER BY total ASC NULLS FIRST",
+    }[sort]
+
+    # WHERE dinámico
+    wh: List[str] = []
+    params: Dict[str, Any] = {"limit": limit, "offset": offset}
+
+    if estado:
+        wh.append("estado = %(estado)s")
+        params["estado"] = estado
 
     if modulo:
-        where.append("modulo = %s"); params.append(modulo)
-    if estado:
-        where.append("estado = %s"); params.append(estado)
-    if secretaria:
-        where.append("secretaria = %s"); params.append(secretaria)
-    if created_by:
-        where.append("created_by = %s"); params.append(created_by)
-    if fecha_desde:
-        where.append("fecha_pedido >= %s::date"); params.append(fecha_desde)
-    if fecha_hasta:
-        where.append("fecha_pedido <= %s::date"); params.append(fecha_hasta)
-    if min_total is not None:
-        where.append("total >= %s::numeric"); params.append(min_total)
-    if max_total is not None:
-        where.append("total <= %s::numeric"); params.append(max_total)
+        wh.append("modulo ILIKE %(modulo)s")
+        params["modulo"] = f"%{modulo}%"
 
-    if where:
-        base_sql += " WHERE " + " AND ".join(where)
+    if q:
+        wh.append("""(
+            id_tramite ILIKE %(q)s
+            OR secretaria ILIKE %(q)s
+            OR COALESCE(solicitante,'') ILIKE %(q)s
+            OR modulo ILIKE %(q)s
+        )""")
+        params["q"] = f"%{q}%"
 
-    order_clause = {
-        "created_at_asc":   " ORDER BY created_at ASC, id ASC ",
-        "created_at_desc":  " ORDER BY created_at DESC, id DESC ",
-        "creado_asc":       " ORDER BY creado ASC, id ASC ",
-        "creado_desc":      " ORDER BY creado DESC, id DESC ",
-        "fecha_pedido_asc": " ORDER BY fecha_pedido ASC, id ASC ",
-        "fecha_pedido_desc":" ORDER BY fecha_pedido DESC, id DESC ",
-        "numero_asc":       " ORDER BY numero ASC ",
-        "numero_desc":      " ORDER BY numero DESC ",
-        "total_asc":        " ORDER BY total ASC NULLS LAST, id ASC ",
-        "total_desc":       " ORDER BY total DESC NULLS LAST, id DESC ",
-        "id_asc":           " ORDER BY id ASC ",
-        "id_desc":          " ORDER BY id DESC ",
-    }[order]
+    where_sql = "WHERE " + " AND ".join(wh) if wh else ""
 
-    sql = base_sql + order_clause + " LIMIT %s OFFSET %s "
-    params.extend([limit, offset])
-
-    try:
-        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sql, params)
-            return cur.fetchall()
-    except PsycopgError as e:
-        raise HTTPException(status_code=500, detail=f"DB error v_pedidos_list: {e.__class__.__name__}: {str(e).strip()}")
-
-@router.get("/pedidos/list/{id}", response_model=dict)
-def get_pedido_list_item(id: int):
-    sql = """
-        SELECT
-          id, numero, modulo, modulo_name, estado, estado_label, secretaria,
-          creado, created_by, solicitante, total, fecha_pedido,
-          presupuesto_estimado, created_at, updated_at
-        FROM public.v_pedidos_list
-        WHERE id = %s
-        LIMIT 1;
+    # SQL base sobre la vista
+    base = f"""
+      SELECT id, id_tramite, modulo, secretaria, solicitante, estado, total, creado
+      FROM public.ui_pedidos_listado
+      {where_sql}
     """
+
+    # Conteo total para paginación
+    sql_count = f"SELECT COUNT(*) AS count FROM ({base}) t"
+    sql_page  = f"{base} {sort_sql} LIMIT %(limit)s OFFSET %(offset)s"
+
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sql, (id,))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="Pedido no encontrado en v_pedidos_list")
-            return row
-    except PsycopgError as e:
-        raise HTTPException(status_code=500, detail=f"DB error v_pedidos_list: {e.__class__.__name__}: {str(e).strip()}")
+            cur.execute(sql_count, params)
+            count = cur.fetchone()["count"]
+
+            cur.execute(sql_page, params)
+            items = cur.fetchall()
+
+        return {
+            "items": items,
+            "count": count,
+            "limit": limit,
+            "offset": offset,
+            "sort": sort,
+            "filters": {"q": q, "estado": estado, "modulo": modulo},
+        }
+    except Exception as e:
+        # Si la vista no existe o hay error SQL
+        raise HTTPException(status_code=500, detail=f"Error listando pedidos: {e}")

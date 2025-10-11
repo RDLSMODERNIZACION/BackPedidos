@@ -10,6 +10,8 @@ import os
 import shutil
 
 from app.db import get_conn
+# 🔁 importo el uploader nuevo para delegar en él (sube a Supabase y hace transiciones)
+from app.routes.pedidos import upload_archivo
 
 router = APIRouter(prefix="/ui", tags=["ui"])
 
@@ -139,13 +141,6 @@ def ui_pedidos_list(
 def ui_pedido_detalle(pedido_id: int) -> Dict[str, Any]:
     """
     Devuelve generales + ambiente + módulo del pedido.
-    Estructura:
-    {
-      id, numero, estado, secretaria, solicitante, creado,
-      fecha_pedido, fecha_desde, fecha_hasta, presupuesto_estimado, observaciones,
-      ambito: { tipo: "obra"|"mantenimientodeescuelas"|"ninguno", obra?, escuelas? },
-      modulo: { tipo: "servicios"|"alquiler"|"adquisicion"|"reparacion", ... } | null
-    }
     """
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -219,7 +214,10 @@ def ui_pedido_detalle(pedido_id: int) -> Dict[str, Any]:
             # Módulo (uno por pedido)
             # Servicios
             cur.execute("""
-                SELECT tipo_servicio, detalle_mantenimiento, tipo_profesional, dia_desde, dia_hasta
+                SELECT
+                  tipo_servicio,
+                  COALESCE(detalle_mantenimiento, servicio_requerido) AS detalle_mantenimiento,
+                  tipo_profesional, dia_desde, dia_hasta
                   FROM public.pedido_servicios
                  WHERE pedido_id=%s
             """, (pedido_id,))
@@ -419,7 +417,11 @@ def _pedido_estado(conn, pedido_id: int) -> str:
         return row["estado"]
 
 @router.get("/pedidos/{pedido_id}/archivos")
-def ui_pedido_list_archivos(pedido_id: int) -> List[Dict[str, Any]]:
+def ui_list_archivos(pedido_id: int) -> Dict[str, Any]:
+    """
+    Lista adjuntos desde public.pedido_archivo.
+    Respuesta: { items: [{ id, kind, filename, size_bytes, url, uploaded_at, download }] }
+    """
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
@@ -433,61 +435,40 @@ def ui_pedido_list_archivos(pedido_id: int) -> List[Dict[str, Any]]:
                   created_at    AS uploaded_at
                 FROM public.pedido_archivo
                WHERE pedido_id = %s
-               ORDER BY created_at DESC
+               ORDER BY created_at DESC, id DESC
             """, (pedido_id,))
-            return cur.fetchall()
+            rows = cur.fetchall() or []
+
+        items = [{
+            "id": r["id"],
+            "kind": r["kind"],
+            "filename": r["filename"],
+            "content_type": r["content_type"],
+            "size_bytes": r["size_bytes"],
+            "url": r["url"],
+            "uploaded_at": r["uploaded_at"].isoformat() if r["uploaded_at"] else None,
+            "download": f"/pedidos/archivos/{r['id']}/download",
+        } for r in rows]
+
+        return {"items": items}
     except (OperationalError, DatabaseError) as e:
         raise HTTPException(status_code=500, detail=f"Error listando archivos: {e}")
 
 @router.post("/pedidos/{pedido_id}/archivo/formal")
-def ui_pedido_upload_formal(pedido_id: int, pdf: UploadFile = File(...)) -> Dict[str, Any]:
+async def ui_upload_formal(pedido_id: int, pdf: UploadFile = File(...)) -> Dict[str, Any]:
     """
-    Sube/reescribe el PDF formal firmado (tipo_doc='formal_pdf').
-    Requiere que el pedido esté EN estado 'aprobado'.
-    Guarda el archivo en {FILES_DIR}/pedidos/<id>/formal.pdf y hace UPSERT contra (pedido_id, tipo_doc).
+    Compatibilidad con la UI antigua:
+    sube el 'PDF firmado' como tipo_doc=formal_pdf usando el endpoint nuevo.
+    Requiere estado 'aprobado' (se valida en upload_archivo → luego pasa a 'en_proceso').
     """
+    if not pdf or not pdf.filename:
+        raise HTTPException(status_code=400, detail="Falta PDF")
     if pdf.content_type not in ("application/pdf",):
         raise HTTPException(status_code=415, detail="Sólo se acepta PDF")
 
-    try:
-        with get_conn() as conn:
-            estado = _pedido_estado(conn, pedido_id)
-            if estado != "aprobado":
-                raise HTTPException(status_code=409, detail=f"El pedido no está aprobado (estado actual: {estado})")
-
-            # Guardado en disco
-            pedido_dir = os.path.join(FILES_DIR, "pedidos", str(pedido_id))
-            os.makedirs(pedido_dir, exist_ok=True)
-            dest_path = os.path.join(pedido_dir, "formal.pdf")
-            with open(dest_path, "wb") as out:
-                shutil.copyfileobj(pdf.file, out)
-
-            url = f"/files/pedidos/{pedido_id}/formal.pdf"
-            size = os.path.getsize(dest_path)
-
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute("""
-                    INSERT INTO public.pedido_archivo
-                        (pedido_id, storage_path, file_name, content_type, bytes, tipo_doc)
-                    VALUES (%s, %s, %s, %s, %s, 'formal_pdf')
-                    ON CONFLICT (pedido_id, tipo_doc)
-                    DO UPDATE SET
-                        storage_path = EXCLUDED.storage_path,
-                        file_name    = EXCLUDED.file_name,
-                        content_type = EXCLUDED.content_type,
-                        bytes        = EXCLUDED.bytes,
-                        created_at   = NOW()
-                    RETURNING
-                      id,
-                      tipo_doc      AS kind,
-                      file_name     AS filename,
-                      content_type,
-                      bytes         AS size_bytes,
-                      storage_path  AS url,
-                      created_at    AS uploaded_at
-                """, (pedido_id, url, pdf.filename, pdf.content_type, size))
-                row = cur.fetchone()
-                conn.commit()
-                return row
-    except (OperationalError, DatabaseError) as e:
-        raise HTTPException(status_code=500, detail=f"Error subiendo formal.pdf: {e}")
+    # delega en /pedidos/{pedido_id}/archivos con tipo_doc=formal_pdf
+    return await upload_archivo(
+        pedido_id=pedido_id,
+        tipo_doc="formal_pdf",
+        archivo=pdf,
+    )

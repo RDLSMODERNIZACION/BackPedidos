@@ -23,14 +23,31 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "pedidos-prod")
 
-ALLOWED_TIPO_DOC = {"presupuesto_1", "presupuesto_2", "anexo1_obra", "formal_pdf"}
+# Permitidos (incluye detonadores de estado)
+ALLOWED_TIPO_DOC = {
+    "presupuesto_1",
+    "presupuesto_2",
+    "anexo1_obra",
+    "formal_pdf",   # → en_proceso
+    "expediente_1", # → area_pago
+    "expediente_2", # → cerrado
+}
 
 # =========================
 # Pydantic: Entrada
 # =========================
 class GeneralIn(BaseModel):
     secretaria: str
-    estado: Literal["borrador", "enviado", "en_revision", "aprobado", "rechazado", "cerrado"] = "enviado"
+    estado: Literal[
+        "borrador",
+        "enviado",
+        "en_revision",
+        "aprobado",
+        "rechazado",
+        "en_proceso",
+        "area_pago",
+        "cerrado",
+    ] = "enviado"
     fecha_pedido: Optional[date] = None
     fecha_desde: Optional[date] = None
     fecha_hasta: Optional[date] = None
@@ -116,6 +133,29 @@ def _lookup_secretaria_id(cur, nombre: str) -> int:
     if not row:
         raise HTTPException(status_code=400, detail=f"Secretaría no encontrada: {nombre}")
     return row["id"]
+
+def _set_estado(cur, pedido_id: int, nuevo: str, changed_by: Optional[str] = None):
+    """Cambia estado en public.pedido y registra en pedido_historial (si cambió)."""
+    cur.execute("SELECT estado FROM public.pedido WHERE id=%s", (pedido_id,))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Pedido no encontrado")
+    anterior = row["estado"]
+    if anterior == nuevo:
+        return
+    cur.execute(
+        "UPDATE public.pedido SET estado=%s, updated_at=now() WHERE id=%s",
+        (nuevo, pedido_id),
+    )
+    # pedido_historial: id, pedido_id, estado_anterior, estado_nuevo, motivo, changed_by, created_at
+    cur.execute(
+        """
+        INSERT INTO public.pedido_historial
+          (pedido_id, estado_anterior, estado_nuevo, motivo, changed_by)
+        VALUES (%s, %s, %s, %s, %s)
+        """,
+        (pedido_id, anterior, nuevo, None, changed_by or "system"),
+    )
 
 # =========================
 # Catálogo de Escuelas
@@ -504,7 +544,7 @@ def create_pedido_full(payload: PedidoCreate) -> Dict[str, Any]:
                         VALUES (%s, %s, %s, %s, %s)
                     """, (pedido_id, "profesionales", m.tipo_profesional, m.dia_desde, m.dia_hasta))
 
-            # (Si querés, acá agregás bloques para alquiler/adquisicion/reparacion)
+            # (a futuro podés agregar bloques para alquiler/adquisicion/reparacion)
 
             return {
                 "ok": True,
@@ -518,7 +558,7 @@ def create_pedido_full(payload: PedidoCreate) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"create_error: {e}")
 
 # =========================
-# Anexos (Supabase Storage)
+# Anexos (Supabase Storage) + transiciones automáticas de estado
 # =========================
 def _sb_object_path(pedido_id: int, tipo_doc: str, filename: str) -> str:
     safe = (filename or "archivo.pdf").replace("/", "_").replace("\\", "_").strip()
@@ -527,7 +567,7 @@ def _sb_object_path(pedido_id: int, tipo_doc: str, filename: str) -> str:
 @router.post("/{pedido_id}/archivos")
 async def upload_archivo(
     pedido_id: int,
-    tipo_doc: str = Form(...),           # 'anexo1_obra' | 'formal_pdf' | 'presupuesto_1' | 'presupuesto_2'
+    tipo_doc: str = Form(...),           # 'anexo1_obra' | 'formal_pdf' | 'presupuesto_1' | 'presupuesto_2' | 'expediente_1' | 'expediente_2'
     archivo: UploadFile = File(...),     # clave "archivo" en multipart/form-data
 ):
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
@@ -544,11 +584,13 @@ async def upload_archivo(
     if not data:
         raise HTTPException(status_code=400, detail="El archivo llegó vacío (0 bytes)")
 
+    # Verificar pedido existe
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute("SELECT 1 FROM public.pedido WHERE id = %s;", (pedido_id,))
         if not cur.fetchone():
             raise HTTPException(status_code=404, detail="Pedido no encontrado")
 
+    # Subir a storage
     object_key = _sb_object_path(pedido_id, tipo_doc, archivo.filename)
     upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{object_key}"
     async with httpx.AsyncClient(timeout=60) as client:
@@ -567,6 +609,7 @@ async def upload_archivo(
     storage_path = f"supabase://{SUPABASE_BUCKET}/{object_key}"
     size = len(data)
 
+    # Guardar metadatos en DB
     sql = """
     INSERT INTO public.pedido_archivo
       (pedido_id, storage_path, file_name, content_type, bytes, tipo_doc)
@@ -584,6 +627,28 @@ async def upload_archivo(
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(sql, (pedido_id, storage_path, archivo.filename, mime, size, tipo_doc))
         row = cur.fetchone()
+        conn.commit()
+
+    # Transiciones automáticas según tipo_doc
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT estado FROM public.pedido WHERE id=%s", (pedido_id,))
+        r = cur.fetchone()
+        if not r:
+            raise HTTPException(status_code=404, detail="Pedido no encontrado")
+        estado = r["estado"]
+
+        if tipo_doc == "formal_pdf":
+            if estado in ("borrador", "enviado", "en_revision", "aprobado"):
+                _set_estado(cur, pedido_id, "en_proceso", changed_by="upload:formal_pdf")
+
+        elif tipo_doc == "expediente_1":
+            if estado != "cerrado":
+                _set_estado(cur, pedido_id, "area_pago", changed_by="upload:expediente_1")
+
+        elif tipo_doc == "expediente_2":
+            if estado != "cerrado":
+                _set_estado(cur, pedido_id, "cerrado", changed_by="upload:expediente_2")
+
         conn.commit()
 
     return {"ok": True, "archivo_id": row["id"], "bytes": size, "path": storage_path}

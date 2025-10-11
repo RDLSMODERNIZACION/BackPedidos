@@ -10,7 +10,7 @@ import os
 import shutil
 
 from app.db import get_conn
-# 🔁 importo el uploader nuevo para delegar en él (sube a Supabase y hace transiciones)
+# 🔁 delega la subida en el uploader “nuevo” (Supabase + metadatos)
 from app.routes.pedidos import upload_archivo
 
 router = APIRouter(prefix="/ui", tags=["ui"])
@@ -279,7 +279,7 @@ def ui_pedido_detalle(pedido_id: int) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"ui_pedido_detalle_error: {e}")
 
 # =========================
-# Cambio de estado
+# Cambio de estado (trámite)
 # =========================
 
 EstadoNuevo = Literal["aprobado", "en_revision"]
@@ -420,7 +420,7 @@ def _pedido_estado(conn, pedido_id: int) -> str:
 def ui_list_archivos(pedido_id: int) -> Dict[str, Any]:
     """
     Lista adjuntos desde public.pedido_archivo.
-    Respuesta: { items: [{ id, kind, filename, size_bytes, url, uploaded_at, download }] }
+    Respuesta: { items: [{ id, kind, filename, size_bytes, url, uploaded_at, download, review_* }] }
     """
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -432,7 +432,11 @@ def ui_list_archivos(pedido_id: int) -> Dict[str, Any]:
                   content_type,
                   bytes         AS size_bytes,
                   storage_path  AS url,
-                  created_at    AS uploaded_at
+                  created_at    AS uploaded_at,
+                  review_status,
+                  review_notes,
+                  reviewed_by,
+                  reviewed_at
                 FROM public.pedido_archivo
                WHERE pedido_id = %s
                ORDER BY created_at DESC, id DESC
@@ -448,6 +452,10 @@ def ui_list_archivos(pedido_id: int) -> Dict[str, Any]:
             "url": r["url"],
             "uploaded_at": r["uploaded_at"].isoformat() if r["uploaded_at"] else None,
             "download": f"/pedidos/archivos/{r['id']}/download",
+            "review_status": r["review_status"] or "pendiente",
+            "review_notes": r["review_notes"],
+            "reviewed_by": r["reviewed_by"],
+            "reviewed_at": r["reviewed_at"].isoformat() if r["reviewed_at"] else None,
         } for r in rows]
 
         return {"items": items}
@@ -459,16 +467,112 @@ async def ui_upload_formal(pedido_id: int, pdf: UploadFile = File(...)) -> Dict[
     """
     Compatibilidad con la UI antigua:
     sube el 'PDF firmado' como tipo_doc=formal_pdf usando el endpoint nuevo.
-    Requiere estado 'aprobado' (se valida en upload_archivo → luego pasa a 'en_proceso').
+    (El estado del pedido se moverá en la APROBACIÓN del documento, no aquí.)
     """
     if not pdf or not pdf.filename:
         raise HTTPException(status_code=400, detail="Falta PDF")
     if pdf.content_type not in ("application/pdf",):
         raise HTTPException(status_code=415, detail="Sólo se acepta PDF")
 
-    # delega en /pedidos/{pedido_id}/archivos con tipo_doc=formal_pdf
     return await upload_archivo(
         pedido_id=pedido_id,
         tipo_doc="formal_pdf",
         archivo=pdf,
     )
+
+# =========================
+# Revisión de documentos (Aprobar / Observar)
+# =========================
+
+class ReviewIn(BaseModel):
+    decision: Literal["aprobado", "observado"]
+    notes: Optional[str] = None
+
+@router.post("/pedidos/archivos/{archivo_id}/review")
+def ui_review_archivo(
+    archivo_id: int,
+    body: ReviewIn,
+    x_user: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    """
+    Aprueba u observa un archivo (formal_pdf, expediente_1, expediente_2).
+    - Actualiza review_* en pedido_archivo
+    - Si 'aprobado', mueve el estado del pedido según tipo_doc:
+        formal_pdf   -> en_proceso
+        expediente_1 -> area_pago
+        expediente_2 -> cerrado
+    - Si 'observado', NO mueve el estado (espera resubida).
+    """
+    try:
+        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+            # 0) Bloquear fila de archivo
+            cur.execute("""
+                SELECT pedido_id, tipo_doc
+                  FROM public.pedido_archivo
+                 WHERE id = %s
+                 FOR UPDATE
+            """, (archivo_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Archivo no encontrado")
+
+            pedido_id = row["pedido_id"]
+            tipo_doc  = row["tipo_doc"]
+
+            # 1) Actualizar review_* del archivo
+            cur.execute("""
+                UPDATE public.pedido_archivo
+                   SET review_status = %s,
+                       review_notes  = %s,
+                       reviewed_by   = %s,
+                       reviewed_at   = now()
+                 WHERE id = %s
+             RETURNING id
+            """, (body.decision, (body.notes or None), (x_user or "ui"), archivo_id))
+            cur.fetchone()
+
+            # 2) Mover estado del pedido SOLO si se aprobó
+            if body.decision == "aprobado":
+                nuevo_estado = None
+                if tipo_doc == "formal_pdf":
+                    nuevo_estado = "en_proceso"
+                elif tipo_doc == "expediente_1":
+                    nuevo_estado = "area_pago"
+                elif tipo_doc == "expediente_2":
+                    nuevo_estado = "cerrado"
+
+                if nuevo_estado:
+                    # lock pedido
+                    cur.execute("SELECT estado FROM public.pedido WHERE id=%s FOR UPDATE", (pedido_id,))
+                    p = cur.fetchone()
+                    if not p:
+                        raise HTTPException(status_code=404, detail="Pedido no encontrado")
+                    estado_anterior = p["estado"]
+                    if estado_anterior != nuevo_estado:
+                        cur.execute("""
+                            UPDATE public.pedido
+                               SET estado=%s, updated_at=now()
+                             WHERE id=%s
+                         RETURNING updated_at
+                        """, (nuevo_estado, pedido_id))
+                        cur.fetchone()
+                        # historial
+                        cur.execute("""
+                            INSERT INTO public.pedido_historial
+                                (pedido_id, estado_anterior, estado_nuevo, motivo, changed_by)
+                            VALUES (%s, %s, %s, %s, %s)
+                        """, (
+                            pedido_id, estado_anterior, nuevo_estado,
+                            f"aprobación de {tipo_doc}", x_user or "ui"
+                        ))
+
+            conn.commit()
+            return {
+                "ok": True,
+                "archivo_id": archivo_id,
+                "pedido_id": pedido_id,
+                "tipo_doc": tipo_doc,
+                "decision": body.decision,
+            }
+    except (OperationalError, DatabaseError) as e:
+        raise HTTPException(status_code=500, detail=f"Error revisando archivo: {e}")

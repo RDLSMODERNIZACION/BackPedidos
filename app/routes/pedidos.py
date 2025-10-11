@@ -295,6 +295,147 @@ def catalogo_obras_create(body: ObraCatIn) -> Dict[str, Any]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error creando obra: {e}")
 
+# ========= Catálogo de Unidades Oficiales =========
+
+class UnidadIn(BaseModel):
+    dominio: Optional[str] = None       # puede faltar (S/D, NO POSEE)
+    unidad_nro: Optional[int] = None    # preferido para selección
+    marca: Optional[str] = None
+    modelo: Optional[str] = None
+    activa: Optional[bool] = True
+
+def _ensure_catalog_unidad(cur) -> None:
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.catalog_unidad (
+          id           BIGSERIAL PRIMARY KEY,
+          dominio      TEXT,              -- SIN unique: puede repetirse S/D
+          unidad_nro   INTEGER UNIQUE,    -- clave de negocio
+          marca        TEXT,
+          modelo       TEXT,
+          activa       BOOLEAN NOT NULL DEFAULT TRUE,
+          created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+          CHECK (dominio IS NOT NULL OR unidad_nro IS NOT NULL)
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_catalog_unidad_marca ON public.catalog_unidad (marca);")
+
+@router.get("/catalogo/unidades")
+def catalogo_unidades(
+    q: Optional[str] = Query(None, description="Busca en dominio, marca o modelo"),
+    marca: Optional[str] = Query(None),
+    activa: Optional[bool] = Query(True),
+    limit: int = Query(1000, ge=1, le=10000),
+) -> List[Dict[str, Any]]:
+    """
+    Lista unidades para selector (dominio, unidad_nro, marca, modelo, activa).
+    """
+    try:
+        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+            _ensure_catalog_unidad(cur)
+            where, params = [], {}
+            if q:
+                where.append("(COALESCE(dominio,'') ILIKE %(q)s OR COALESCE(marca,'') ILIKE %(q)s OR COALESCE(modelo,'') ILIKE %(q)s)")
+                params["q"] = f"%{q}%"
+            if marca:
+                where.append("marca ILIKE %(marca)s"); params["marca"] = f"%{marca}%"
+            if activa is not None:
+                where.append("activa = %(activa)s"); params["activa"] = activa
+            where_sql = "WHERE " + " AND ".join(where) if where else ""
+            cur.execute(f"""
+                SELECT id, dominio, unidad_nro, marca, modelo, activa
+                  FROM public.catalog_unidad
+                  {where_sql}
+                 ORDER BY COALESCE(unidad_nro, 0) ASC, dominio NULLS LAST
+                 LIMIT {limit}
+            """, params)
+            return cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listando unidades: {e}")
+
+@router.get("/catalogo/unidades/{unidad_nro}")
+def catalogo_unidad_por_nro(unidad_nro: int) -> Dict[str, Any]:
+    """
+    Trae una unidad por NÚMERO (para que el front seleccione 'unidad_nro' y reciba marca/domino/modelo).
+    """
+    try:
+        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+            _ensure_catalog_unidad(cur)
+            cur.execute("""
+                SELECT id, dominio, unidad_nro, marca, modelo, activa
+                  FROM public.catalog_unidad
+                 WHERE unidad_nro = %s
+            """, (unidad_nro,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Unidad no encontrada")
+            return row
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error buscando unidad: {e}")
+
+@router.post("/catalogo/unidades", status_code=201)
+def catalogo_unidades_create(body: UnidadIn) -> Dict[str, Any]:
+    """
+    Agrega/actualiza una unidad. 
+    - Si viene unidad_nro: upsert por unidad_nro.
+    - Si no, y viene dominio: inserta o actualiza buscando por dominio (si existe UNA).
+      (No hay unique por dominio; si hay varias con el mismo dominio, se inserta una nueva.)
+    Devuelve {id, dominio, unidad_nro, marca, modelo, activa}.
+    """
+    if not body.unidad_nro and not body.dominio:
+        raise HTTPException(status_code=422, detail="Debe informar al menos unidad_nro o dominio")
+
+    try:
+        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+            _ensure_catalog_unidad(cur)
+
+            if body.unidad_nro is not None:
+                cur.execute("""
+                    INSERT INTO public.catalog_unidad (dominio, unidad_nro, marca, modelo, activa)
+                    VALUES (%s, %s, %s, %s, COALESCE(%s, TRUE))
+                    ON CONFLICT (unidad_nro) DO UPDATE
+                      SET dominio   = EXCLUDED.dominio,
+                          marca     = EXCLUDED.marca,
+                          modelo    = EXCLUDED.modelo,
+                          activa    = EXCLUDED.activa,
+                          updated_at= now()
+                    RETURNING id, dominio, unidad_nro, marca, modelo, activa
+                """, (body.dominio, body.unidad_nro, body.marca, body.modelo, body.activa))
+                return cur.fetchone()
+
+            # sin unidad_nro: intentar actualizar por dominio si hay UNA coincidencia; si no, insertar
+            if body.dominio:
+                cur.execute("SELECT id FROM public.catalog_unidad WHERE dominio = %s", (body.dominio,))
+                rows = cur.fetchall()
+                if len(rows) == 1:
+                    uid = rows[0]["id"]
+                    cur.execute("""
+                        UPDATE public.catalog_unidad
+                           SET marca = COALESCE(%s, marca),
+                               modelo = COALESCE(%s, modelo),
+                               activa = COALESCE(%s, activa),
+                               updated_at = now()
+                         WHERE id = %s
+                     RETURNING id, dominio, unidad_nro, marca, modelo, activa
+                    """, (body.marca, body.modelo, body.activa, uid))
+                    return cur.fetchone()
+                # 0 o varias: insertar nueva fila
+                cur.execute("""
+                    INSERT INTO public.catalog_unidad (dominio, marca, modelo, activa)
+                    VALUES (%s, %s, %s, COALESCE(%s, TRUE))
+                 RETURNING id, dominio, unidad_nro, marca, modelo, activa
+                """, (body.dominio, body.marca, body.modelo, body.activa))
+                return cur.fetchone()
+
+            # Si llegó acá no había dominio (y tampoco unidad_nro, validado arriba)
+            raise HTTPException(status_code=422, detail="Datos insuficientes para crear unidad")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creando unidad: {e}")
+
 # ------------- POST /pedidos -------------
 
 @router.post("", status_code=201)

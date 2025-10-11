@@ -1,14 +1,33 @@
-# app/routes/pedidos.py
-from fastapi import APIRouter, HTTPException, UploadFile, File, Query
-from pydantic import BaseModel, Field
+# pp/routes/pedidos.py
+# (si tu proyecto usa 'app/routes/pedidos.py', podés copiarlo allí sin cambios)
+from fastapi import APIRouter, HTTPException, UploadFile, File, Query, Form
 from typing import Optional, Literal, List, Union, Dict, Any
+from pydantic import BaseModel, Field
 from psycopg.rows import dict_row
 from app.db import get_conn
 from datetime import date
 
+# ==== Supabase Storage (bucket privado) ====
+import os
+from uuid import uuid4
+import httpx
+
+# =====================================================================
+# Config
+# =====================================================================
 router = APIRouter(prefix="/pedidos", tags=["pedidos"])
 
-# ------------- Pydantic In -------------
+# Variables de entorno (deben estar seteadas en el backend)
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "pedidos-prod")
+
+# Tipos de documento válidos (coinciden con tu CHECK en la tabla)
+ALLOWED_TIPO_DOC = {"presupuesto_1", "presupuesto_2", "anexo1_obra", "formal_pdf"}
+
+# =====================================================================
+# Pydantic: Entrada
+# =====================================================================
 
 class GeneralIn(BaseModel):
     secretaria: str
@@ -85,7 +104,9 @@ class PedidoCreate(BaseModel):
     ambito: AmbitoIn
     modulo: ModuloIn
 
-# ------------- Helpers -------------
+# =====================================================================
+# Helpers DB
+# =====================================================================
 
 def _one_or_none(rows: list[dict]) -> Optional[dict]:
     return rows[0] if rows else None
@@ -97,7 +118,9 @@ def _lookup_secretaria_id(cur, nombre: str) -> int:
         raise HTTPException(status_code=400, detail=f"Secretaría no encontrada: {nombre}")
     return row["id"]
 
-# ========= Catálogo de Escuelas =========
+# =====================================================================
+# Catálogo de Escuelas
+# =====================================================================
 
 class EscuelaIn(BaseModel):
     nombre: str = Field(..., min_length=2, description="Nombre visible de la escuela")
@@ -200,7 +223,9 @@ def catalogo_escuelas_create(body: EscuelaIn) -> Dict[str, Any]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error creando escuela: {e}")
 
-# ========= Catálogo de Obras =========
+# =====================================================================
+# Catálogo de Obras
+# =====================================================================
 
 class ObraCatIn(BaseModel):
     nombre: str = Field(..., min_length=2, description="Nombre visible de la obra/lugar")
@@ -295,7 +320,9 @@ def catalogo_obras_create(body: ObraCatIn) -> Dict[str, Any]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error creando obra: {e}")
 
-# ========= Catálogo de Unidades Oficiales =========
+# =====================================================================
+# Catálogo de Unidades Oficiales
+# =====================================================================
 
 class UnidadIn(BaseModel):
     dominio: Optional[str] = None       # puede faltar (S/D, NO POSEE)
@@ -436,7 +463,9 @@ def catalogo_unidades_create(body: UnidadIn) -> Dict[str, Any]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error creando unidad: {e}")
 
-# ------------- POST /pedidos -------------
+# =====================================================================
+# POST /pedidos  (creación del pedido)
+# =====================================================================
 
 @router.post("", status_code=201)
 def create_pedido_full(payload: PedidoCreate) -> Dict[str, Any]:
@@ -504,7 +533,7 @@ def create_pedido_full(payload: PedidoCreate) -> Dict[str, Any]:
                 """, (pedido_id, a.escuelas.escuela))
 
             # 4) MÓDULO (deja tu inserción según corresponda)
-            # ...
+            # TODO: insertar detalle del módulo m
 
             return {
                 "ok": True,
@@ -517,28 +546,128 @@ def create_pedido_full(payload: PedidoCreate) -> Dict[str, Any]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"create_error: {e}")
 
-# ------------- POST /pedidos/{id}/archivos/anexo1_obra -------------
+# =====================================================================
+# Anexos de pedidos (Supabase Storage + metadatos en DB)
+# =====================================================================
 
+def _sb_object_path(pedido_id: int, tipo_doc: str, filename: str) -> str:
+    safe = (filename or "archivo.pdf").replace("/", "_").replace("\\", "_").strip()
+    return f"pedido_{pedido_id}/{tipo_doc}/{uuid4()}_{safe}"
+
+@router.post("/{pedido_id}/archivos")
+async def upload_archivo(
+    pedido_id: int,
+    tipo_doc: str = Form(...),           # 'anexo1_obra' | 'formal_pdf' | 'presupuesto_1' | 'presupuesto_2'
+    archivo: UploadFile = File(...),     # clave "archivo" en multipart/form-data
+):
+    # Verificaciones básicas
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=500, detail="Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en el backend")
+    if tipo_doc not in ALLOWED_TIPO_DOC:
+        raise HTTPException(status_code=400, detail=f"tipo_doc inválido: {tipo_doc}")
+    if not archivo.filename:
+        raise HTTPException(status_code=400, detail="Falta nombre de archivo")
+    mime = archivo.content_type or "application/pdf"
+    if mime != "application/pdf":
+        raise HTTPException(status_code=415, detail=f"Solo se aceptan PDF. Recibido: {mime}")
+
+    # Leer una sola vez
+    data: bytes = await archivo.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="El archivo llegó vacío (0 bytes)")
+
+    # Verificar existencia de pedido
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT 1 FROM public.pedido WHERE id = %s;", (pedido_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Pedido no encontrado")
+
+    # Subir a Supabase Storage (bucket privado)
+    object_key = _sb_object_path(pedido_id, tipo_doc, archivo.filename)
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{object_key}"
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            upload_url,
+            headers={
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": mime,
+                "x-upsert": "true",
+            },
+            content=data,
+        )
+        if r.status_code not in (200, 201):
+            raise HTTPException(status_code=r.status_code, detail=f"Error subiendo a Storage: {r.text}")
+
+    # Upsert en tabla pedido_archivo
+    storage_path = f"supabase://{SUPABASE_BUCKET}/{object_key}"
+    size = len(data)
+
+    sql = """
+    INSERT INTO public.pedido_archivo
+      (pedido_id, storage_path, file_name, content_type, bytes, tipo_doc)
+    VALUES
+      (%s,        %s,           %s,        %s,           %s,    %s)
+    ON CONFLICT (pedido_id, tipo_doc)
+    DO UPDATE SET
+      storage_path = EXCLUDED.storage_path,
+      file_name    = EXCLUDED.file_name,
+      content_type = EXCLUDED.content_type,
+      bytes        = EXCLUDED.bytes,
+      created_at   = now()
+    RETURNING id;
+    """
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, (pedido_id, storage_path, archivo.filename, mime, size, tipo_doc))
+        row = cur.fetchone()
+        conn.commit()
+
+    return {"ok": True, "archivo_id": row["id"], "bytes": size, "path": storage_path}
+
+@router.get("/archivos/{archivo_id}/signed")
+async def get_signed_download(archivo_id: int, expires_sec: int = 600):
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=500, detail="Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en el backend")
+
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("""
+            SELECT storage_path, file_name, content_type
+            FROM public.pedido_archivo
+            WHERE id = %s
+        """, (archivo_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Archivo no encontrado")
+
+    storage_path: str = row["storage_path"] or ""
+    if not storage_path.startswith("supabase://"):
+        raise HTTPException(status_code=400, detail="Este archivo no está en Supabase Storage")
+
+    _, bucket_and_key = storage_path.split("://", 1)
+    bucket, key = bucket_and_key.split("/", 1)
+
+    sign_url = f"{SUPABASE_URL}/storage/v1/object/sign/{bucket}/{key}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            sign_url,
+            headers={"Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"},
+            json={"expiresIn": expires_sec},
+        )
+        if r.status_code != 200:
+            raise HTTPException(status_code=r.status_code, detail=f"Error firmando URL: {r.text}")
+        payload = r.json()  # {"signedURL": "...", "path": "..."} de Supabase
+        signed_url = f"{SUPABASE_URL}{payload['signedURL']}"
+
+    return {
+        "url": signed_url,
+        "file_name": row["file_name"],
+        "content_type": row["content_type"],
+        "expires_in": expires_sec,
+    }
+
+# Compatibilidad con la ruta anterior:
 @router.post("/{pedido_id}/archivos/anexo1_obra")
 async def upload_anexo1_obra(pedido_id: int, file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="El anexo debe ser PDF.")
-    storage_path = f"uploads/pedido_{pedido_id}/anexo1_obra.pdf"
-
-    try:
-        with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("""
-              INSERT INTO public.pedido_archivo (pedido_id, storage_path, file_name, content_type, bytes, tipo_doc)
-              VALUES (%s,%s,%s,%s,%s,'anexo1_obra')
-              ON CONFLICT (pedido_id, tipo_doc) DO UPDATE
-                SET storage_path = EXCLUDED.storage_path,
-                    file_name    = EXCLUDED.file_name,
-                    content_type = EXCLUDED.content_type,
-                    bytes        = EXCLUDED.bytes,
-                    created_at   = now()
-              RETURNING id
-            """, (pedido_id, storage_path, file.filename, file.content_type or "application/pdf", 0))
-            row = cur.fetchone()
-            return {"ok": True, "archivo_id": row["id"], "storage_path": storage_path}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"upload_error: {e}")
+    """
+    Mantiene la firma vieja (clave 'file') pero delega en el endpoint nuevo.
+    """
+    return await upload_archivo(pedido_id=pedido_id, tipo_doc="anexo1_obra", archivo=file)

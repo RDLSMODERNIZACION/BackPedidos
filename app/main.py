@@ -3,7 +3,9 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles  # ⬅ para servir archivos
-from app.routes import auth, pedidos, ui, vlateral  # ✅ agregamos vlateral
+from fastapi.routing import APIRoute
+
+from app.routes import auth, pedidos, ui, vlateral  # ✅ incluimos vlateral
 
 app = FastAPI(title="Dirac – Pedidos", version="1.0")
 
@@ -27,17 +29,29 @@ os.makedirs(FILES_DIR, exist_ok=True)
 # Servimos todo lo que quede grabado allí (p.ej. /files/pedidos/<id>/formal.pdf)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
 
-# ===== Routers =====
-app.include_router(auth.router)
+# ===== Routers (orden importa) =====
+# 1) Rutas estáticas / deterministas primero (evita que {pedido_id} capture 'overview')
+app.include_router(vlateral.router)  # /ui/pedidos/overview, /ui/pedidos/full-by-numero
+
+# 2) Luego las rutas con path params y el resto
+app.include_router(ui.router)        # /ui/pedidos/{pedido_id}, etc.
 app.include_router(pedidos.router)
-app.include_router(ui.router)        # /ui/pedidos/... existentes
-app.include_router(vlateral.router)  # /ui/pedidos/overview y /ui/pedidos/{id}/full
+app.include_router(auth.router)
 
 # ===== Health =====
 @app.get("/")
 def root():
-  return {"ok": True, "service": "Dirac – Pedidos API", "version": "1.0"}
+    return {"ok": True, "service": "Dirac – Pedidos API", "version": "1.0"}
 
 @app.get("/health")
 def health():
-  return {"ok": True}
+    return {"ok": True}
+
+# ===== Diagnóstico de rutas (opcional) =====
+@app.get("/__routes")
+def list_routes():
+    out = []
+    for r in app.router.routes:
+        if isinstance(r, APIRoute):
+            out.append({"path": r.path, "name": r.name, "methods": sorted(list(r.methods))})
+    return out

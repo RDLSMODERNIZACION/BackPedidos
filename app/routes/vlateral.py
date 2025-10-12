@@ -1,12 +1,13 @@
 # app/routes/vlateral.py
 # Endpoints de lectura para las vistas:
-#   - public.v_pedido_detalle   → /ui/pedidos/{pedido_id:int}/full   (ahora hidrata módulos reales)
+#   - public.v_pedido_detalle   → /ui/pedidos/{pedido_id:int}/full
 #   - public.v_pedido_overview  → /ui/pedidos/overview
 #
 # Añadido:
-#   - Escaneo de TODAS las tablas de módulos para hallar filas por pedido_id
-#   - GET /ui/pedidos/{pedido_id:int}/modulos (todos los módulos con filas)
-#   - Si hay >1 módulo con filas, además de modulo/modulo_payload, se agrega modulos_payload={...}
+#   - /ui/pedidos/{pedido_id:int}/modulos       (módulos con filas reales)
+#   - /ui/pedidos/{pedido_id:int}/timeline      (fechas por etapa + timeline rica)
+#   - /ui/pedidos/{pedido_id:int}/etapas        (solo fechas por etapa)
+#   - Aliases anti-colisión: /ui/pedidos/_/overview, /ui/pedidos/_/full-by-numero
 # ------------------------------------------------------------------------------
 
 from fastapi import APIRouter, HTTPException, Query
@@ -29,40 +30,14 @@ def _db_url() -> str:
 def _get_conn():
     return psycopg.connect(_db_url(), row_factory=dict_row)
 
-# ---------- Config módulos ----------
+# ---------- Config módulos (según tu esquema real) ----------
 
-# Ajustá nombres si tus tablas difieren
 MODULE_CANDIDATES: Dict[str, List[str]] = {
-    "servicios": [
-        "public.pedido_servicios",
-        "public.pedidos_servicios",
-        "public.servicios_pedido",
-    ],
-    "alquiler": [
-        "public.pedido_alquiler",
-        "public.pedidos_alquiler",
-    ],
-    "adquisicion": [
-        "public.pedidos_adquisicion",
-        "public.pedidos_adquisiciones",
-        "public.adquisicion_pedido",
-    ],
-    "reparacion": [
-        "public.pedido_reparacion",
-        "public.pedidos_reparacion",
-        "public.pedidos_reparaciones",
-        "public.reparacion_pedido",
-    ],
-    "obras": [
-        "public.pedido_obras",
-        "public.pedidos_obras",
-        "public.pedidos_obra",
-    ],
-    "mantenimiento_escuelas": [
-        "public.pedidos_mantenimiento_escuelas",
-        "public.pedidos_mant_escuela",
-        "public.pedidos_mantescuela",
-    ],
+    "servicios":   ["public.pedido_servicios"],
+    "alquiler":    ["public.pedido_alquiler"],
+    "reparacion":  ["public.pedido_reparacion"],
+    "adquisicion": ["public.pedido_adquisicion"],  # items en public.pedido_adquisicion_item
+    # si más adelante agregás otros, sumalos acá
 }
 
 def _regclass_exists(con, fqname: str) -> bool:
@@ -72,16 +47,24 @@ def _regclass_exists(con, fqname: str) -> bool:
         return bool(row and row.get("ok"))
 
 def _rows_for_table(con, fqname: str, pedido_id: int) -> List[Dict[str, Any]]:
-    # Asumimos columna pedido_id en tablas de módulos
     sql = f"SELECT * FROM {fqname} WHERE pedido_id = %s"
     with con.cursor() as cur:
         cur.execute(sql, (pedido_id,))
         return cur.fetchall() or []
 
+def _adquisicion_items(con, pedido_id: int) -> List[Dict[str, Any]]:
+    """ Devuelve items de adquisición (si la tabla existe). """
+    if not _regclass_exists(con, "public.pedido_adquisicion_item"):
+        return []
+    with con.cursor() as cur:
+        cur.execute("SELECT * FROM public.pedido_adquisicion_item WHERE pedido_id = %s ORDER BY id", (pedido_id,))
+        return cur.fetchall() or []
+
 def _scan_modules_for_pedido(con, pedido_id: int) -> Dict[str, Any]:
     """
-    Recorre todas las tablas candidatas por módulo y devuelve
-    { modulo -> { 'table': fqname, 'rows': [...] } } solo para módulos con filas.
+    Recorre todas las tablas candidatas por módulo y devuelve:
+      { modulo -> { 'table': fqname, 'rows': [...] } }
+    Solo incluye módulos con filas para ese pedido.
     """
     found: Dict[str, Any] = {}
     for modulo, tables in MODULE_CANDIDATES.items():
@@ -90,6 +73,17 @@ def _scan_modules_for_pedido(con, pedido_id: int) -> Dict[str, Any]:
                 continue
             rows = _rows_for_table(con, fq, pedido_id)
             if rows:
+                # Enriquecemos adquisición con sus items
+                if modulo == "adquisicion":
+                    items = _adquisicion_items(con, pedido_id)
+                    # si es una sola fila de cabecera, adjuntamos items como subcampo
+                    if len(rows) == 1:
+                        r0 = dict(rows[0])
+                        r0["items"] = items
+                        rows = [r0]
+                    else:
+                        # varias filas (no debería), devolvemos items aparte
+                        rows = [*rows, {"_items": items}]
                 found[modulo] = {"table": fq, "rows": rows}
                 break  # si una de las variantes tuvo filas, no seguimos probando ese módulo
     return found
@@ -97,13 +91,13 @@ def _scan_modules_for_pedido(con, pedido_id: int) -> Dict[str, Any]:
 def _attach_module_payload(con, base_row: Dict[str, Any]) -> Dict[str, Any]:
     """
     Adjunta modulo/modulo_payload si encuentra exactamente un módulo con filas.
-    Si encuentra varios, adjunta modulos_payload con todos y, como cortesía,
-    setea modulo/modulo_payload al primero (por compatibilidad).
+    Si encuentra varios, adjunta modulos_payload con todos y, por compat,
+    setea modulo/modulo_payload al primero (orden alfabético).
     """
     if not base_row or not base_row.get("id"):
         return base_row
 
-    # Si ya viene un payload desde la vista, respetamos
+    # Si ya viene desde la vista, respetamos
     if base_row.get("modulo_payload"):
         return base_row
 
@@ -111,24 +105,17 @@ def _attach_module_payload(con, base_row: Dict[str, Any]) -> Dict[str, Any]:
     found = _scan_modules_for_pedido(con, pedido_id)
 
     if not found:
-        # No hay filas en ningún módulo para este pedido
         return base_row
 
-    # Si hay uno solo módulo con filas → set directo
     if len(found) == 1:
         (modulo_key, info), = found.items()
         rows = info["rows"]
         base_row["modulo"] = base_row.get("modulo") or modulo_key
         base_row["modulo_payload"] = rows[0] if len(rows) == 1 else rows
-        # También devolvemos qué tabla fue
         base_row["modulo_table"] = info["table"]
         return base_row
 
-    # Si hay varios módulos con filas (escenario raro) → adjuntamos todos
-    base_row["modulos_payload"] = {
-        k: {"table": v["table"], "rows": v["rows"]} for k, v in found.items()
-    }
-    # Compat: elegimos el primero en orden alfabético para modulo/modulo_payload
+    base_row["modulos_payload"] = {k: {"table": v["table"], "rows": v["rows"]} for k, v in found.items()}
     first_key = sorted(found.keys())[0]
     base_row["modulo"] = base_row.get("modulo") or first_key
     first_rows = found[first_key]["rows"]
@@ -163,12 +150,16 @@ SQL_OVERVIEW_ORDER = {
     "total_asc":    "ORDER BY total ASC NULLS LAST",
 }
 
+# Vistas de timeline / etapas
+SQL_ETAPAS = "SELECT * FROM public.v_pedido_etapas WHERE pedido_id = %s"
+SQL_TL     = "SELECT timeline FROM public.v_pedido_timeline WHERE pedido_id = %s"
+
 # ---------- Endpoints ----------
 
 @router.get("/pedidos/{pedido_id:int}/full")
 def get_pedido_full(pedido_id: int):
     """
-    Snapshot completo (v_pedido_detalle) + módulos reales (escanea todas las tablas candidatas).
+    Snapshot completo (v_pedido_detalle) + módulos reales del esquema.
     """
     with _get_conn() as con, con.cursor() as cur:
         cur.execute(SQL_DETALLE, (pedido_id,))
@@ -251,15 +242,48 @@ def get_pedido_modulos(pedido_id: int):
     Devuelve todos los módulos que tengan filas para este pedido:
     {
       "found": {
-        "servicios": { "table": "public.pedido_servicios", "rows": [...] },
-        "alquiler":  { "table": "...", "rows": [...] },
-        ...
+        "servicios":   { "table": "public.pedido_servicios",   "rows": [...] },
+        "alquiler":    { "table": "public.pedido_alquiler",    "rows": [...] },
+        "reparacion":  { "table": "public.pedido_reparacion",  "rows": [...] },
+        "adquisicion": { "table": "public.pedido_adquisicion", "rows": [ {.., items:[...]} ] }
       }
     }
     """
     with _get_conn() as con:
         found = _scan_modules_for_pedido(con, pedido_id)
         return jsonable_encoder({"found": found})
+
+# ---------- NUEVO: etapas + timeline ----------
+
+@router.get("/pedidos/{pedido_id:int}/etapas")
+def get_pedido_etapas(pedido_id: int):
+    """
+    Devuelve las fechas por etapa (v_pedido_etapas) para un pedido.
+    """
+    with _get_conn() as con, con.cursor() as cur:
+        cur.execute(SQL_ETAPAS, (pedido_id,))
+        row = cur.fetchone()
+        return jsonable_encoder(row or {})
+
+@router.get("/pedidos/{pedido_id:int}/timeline")
+def get_pedido_timeline(pedido_id: int):
+    """
+    Devuelve:
+    {
+      "etapas":   {creado_at, enviado_at, ..., expediente_2_at},
+      "timeline": [{kind, at, ...}, ...]
+    }
+    Requiere vistas: v_pedido_etapas, v_pedido_timeline
+    """
+    with _get_conn() as con, con.cursor() as cur:
+        cur.execute(SQL_ETAPAS, (pedido_id,))
+        etapas = cur.fetchone()
+
+        cur.execute(SQL_TL, (pedido_id,))
+        tl_row = cur.fetchone()
+        timeline = (tl_row or {}).get("timeline")
+
+        return jsonable_encoder({"etapas": etapas, "timeline": timeline or []})
 
 # ---------- Aliases anti-colisión ----------
 

@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles  # ⬅ para servir archivos
 from fastapi.routing import APIRoute
 
-from app.routes import auth, pedidos, ui, vlateral  # ✅ incluimos vlateral
+from app.routes import auth, pedidos, ui, vlateral, wsp  # ✅ sumamos wsp
 
 app = FastAPI(title="Dirac – Pedidos", version="1.0")
 
@@ -30,7 +30,8 @@ os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
 
 # ===== Routers (orden importa) =====
-# 1) Rutas estáticas / deterministas primero (evita que {pedido_id} capture 'overview')
+# 1) Rutas estáticas / deterministas primero
+app.include_router(wsp.router)       # /wsp/... (WhatsApp: webhook, magiclink)
 app.include_router(vlateral.router)  # /ui/pedidos/overview, /ui/pedidos/full-by-numero
 
 # 2) Luego las rutas con path params y el resto

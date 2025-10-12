@@ -1,5 +1,5 @@
 # pp/routes/pedidos.py
-# Nota: si tu proyecto usa el paquete "app", este archivo puede ir como app/routes/pedidos.py
+# Si tu proyecto usa el paquete "app", este archivo puede ir como app/routes/pedidos.py
 # y el import de get_conn (abajo) ya queda bien. Si usás "pp", cambiá a: from pp.db import get_conn
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Query, Form
@@ -23,103 +23,12 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "pedidos-prod")
 
-# Permitidos (incluye detonadores de estado)
+# Permitidos (solo presupuestos y anexo de obra)
 ALLOWED_TIPO_DOC = {
     "presupuesto_1",
     "presupuesto_2",
     "anexo1_obra",
-    "formal_pdf",   # → en_proceso
-    "expediente_1", # → area_pago
-    "expediente_2", # → cerrado
 }
-
-# =========================
-# Pydantic: Entrada
-# =========================
-class GeneralIn(BaseModel):
-    secretaria: str
-    estado: Literal[
-        "borrador",
-        "enviado",
-        "en_revision",
-        "aprobado",
-        "rechazado",
-        "en_proceso",
-        "area_pago",
-        "cerrado",
-    ] = "enviado"
-    fecha_pedido: Optional[date] = None
-    fecha_desde: Optional[date] = None
-    fecha_hasta: Optional[date] = None
-    presupuesto_estimado: Optional[float] = None
-    observaciones: Optional[str] = None
-    created_by_username: Optional[str] = None  # opcional
-
-AmbitoTipo = Literal["ninguno", "obra", "mantenimientodeescuelas"]
-
-class AmbitoObraIn(BaseModel):
-    obra_nombre: str = Field(..., description="Nombre de la obra (Obra)")
-
-class AmbitoEscuelaIn(BaseModel):
-    escuela: str = Field(..., description="Nombre de la escuela (Mantenimiento de Escuelas)")
-
-class AmbitoIn(BaseModel):
-    tipo: AmbitoTipo
-    obra: Optional[AmbitoObraIn] = None
-    escuelas: Optional[AmbitoEscuelaIn] = None  # 'escuelas' para no chocar con palabra reservada
-
-# ======== SERVICIOS (actualizado: otros / profesionales) ========
-class ServiciosIn(BaseModel):
-    tipo: Literal["servicios"]
-    tipo_servicio: Literal["otros", "profesionales"]
-    # “otros”
-    servicio_requerido: Optional[str] = None
-    destino_servicio: Optional[str] = None
-    # “profesionales”
-    tipo_profesional: Optional[str] = None
-    dia_desde: Optional[date] = None
-    dia_hasta: Optional[date] = None
-
-class AlquilerIn(BaseModel):
-    tipo: Literal["alquiler"]
-    categoria: Literal["edificio", "maquinaria", "otros"]
-    uso_edificio: Optional[str] = None
-    ubicacion_edificio: Optional[str] = None
-    uso_maquinaria: Optional[str] = None
-    tipo_maquinaria: Optional[str] = None
-    requiere_combustible: Optional[bool] = None
-    requiere_chofer: Optional[bool] = None
-    cronograma_desde: Optional[date] = None
-    cronograma_hasta: Optional[date] = None
-    horas_por_dia: Optional[float] = None
-    que_alquilar: Optional[str] = None
-    detalle_uso: Optional[str] = None
-
-class AdqItemIn(BaseModel):
-    descripcion: str
-    cantidad: float = 1
-    unidad: Optional[str] = None
-    precio_unitario: Optional[float] = None
-
-class AdquisicionIn(BaseModel):
-    tipo: Literal["adquisicion"]
-    proposito: Optional[str] = None
-    modo_adquisicion: Literal["uno", "muchos"] = "uno"
-    items: List[AdqItemIn] = []
-
-class ReparacionIn(BaseModel):
-    tipo: Literal["reparacion"]
-    tipo_reparacion: Literal["maquinaria", "otros"]
-    unidad_reparar: Optional[str] = None
-    que_reparar: Optional[str] = None
-    detalle_reparacion: Optional[str] = None
-
-ModuloIn = Union[ServiciosIn, AlquilerIn, AdquisicionIn, ReparacionIn]
-
-class PedidoCreate(BaseModel):
-    generales: GeneralIn
-    ambito: AmbitoIn
-    modulo: ModuloIn
 
 # =========================
 # Helpers DB
@@ -133,29 +42,6 @@ def _lookup_secretaria_id(cur, nombre: str) -> int:
     if not row:
         raise HTTPException(status_code=400, detail=f"Secretaría no encontrada: {nombre}")
     return row["id"]
-
-def _set_estado(cur, pedido_id: int, nuevo: str, changed_by: Optional[str] = None):
-    """Cambia estado en public.pedido y registra en pedido_historial (si cambió)."""
-    cur.execute("SELECT estado FROM public.pedido WHERE id=%s", (pedido_id,))
-    row = cur.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="Pedido no encontrado")
-    anterior = row["estado"]
-    if anterior == nuevo:
-        return
-    cur.execute(
-        "UPDATE public.pedido SET estado=%s, updated_at=now() WHERE id=%s",
-        (nuevo, pedido_id),
-    )
-    # pedido_historial: id, pedido_id, estado_anterior, estado_nuevo, motivo, changed_by, created_at
-    cur.execute(
-        """
-        INSERT INTO public.pedido_historial
-          (pedido_id, estado_anterior, estado_nuevo, motivo, changed_by)
-        VALUES (%s, %s, %s, %s, %s)
-        """,
-        (pedido_id, anterior, nuevo, None, changed_by or "system"),
-    )
 
 # =========================
 # Catálogo de Escuelas
@@ -463,28 +349,53 @@ def catalogo_unidades_create(body: UnidadIn) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Error creando unidad: {e}")
 
 # =========================
-# POST /pedidos (creación)
+# POST /pedidos (creación) — formato v2 del front
 # =========================
-@router.post("", status_code=201)
-def create_pedido_full(payload: PedidoCreate) -> Dict[str, Any]:
-    g = payload.generales
-    a = payload.ambito
-    m = payload.modulo
+class V2Generales(BaseModel):
+    secretaria: str
+    fecha_pedido: Optional[date] = None
+    fecha_desde: Optional[date] = None
+    fecha_hasta: Optional[date] = None
+    presupuesto_estimado: Optional[str | float] = None
+    observaciones: Optional[str] = None
+    estado: Optional[Literal[
+        "borrador","enviado","en_revision","aprobado","rechazado","en_proceso","area_pago","cerrado"
+    ]] = "enviado"
+    created_by_username: Optional[str] = None
 
-    MAP_AMBITO = {
+class V2ModuloDraft(BaseModel):
+    modulo: Literal["servicios","alquiler","adquisicion","reparacion"]
+    payload: Dict[str, Any]
+
+class PedidoV2(BaseModel):
+    generales: V2Generales
+    modulo_seleccionado: Literal["servicios","alquiler","adquisicion","reparacion"]
+    modulo_draft: V2ModuloDraft
+    ambitoIncluido: Literal["ninguno","obra","mantenimientodeescuelas"]
+    especiales: Optional[Dict[str, Any]] = None
+
+@router.post("", status_code=201)
+def create_pedido_simple(body: PedidoV2) -> Dict[str, Any]:
+    g = body.generales
+    md = body.modulo_draft
+    ambitoIncluido = body.ambitoIncluido
+
+    AMBITO_MAP = {
         "ninguno": "general",
         "obra": "obra",
         "mantenimientodeescuelas": "mant_escuela",
     }
-    tipo_ui = a.tipo
-    tipo_db = MAP_AMBITO.get(tipo_ui)
-    if tipo_db is None:
-        raise HTTPException(status_code=422, detail=f"Ambito inválido: {tipo_ui}")
+    tipo_ambito_db = AMBITO_MAP[ambitoIncluido]
 
-    if tipo_ui == "obra" and not a.obra:
-        raise HTTPException(status_code=400, detail="Falta 'ambito.obra' para tipo=obra.")
-    if tipo_ui == "mantenimientodeescuelas" and not a.escuelas:
-        raise HTTPException(status_code=400, detail="Falta 'ambito.escuelas' para tipo=mantenimientodeescuelas.")
+    # normalizar presupuesto
+    presu: Optional[float] = None
+    if isinstance(g.presupuesto_estimado, (int, float)):
+        presu = float(g.presupuesto_estimado)
+    elif isinstance(g.presupuesto_estimado, str):
+        try:
+            presu = float(g.presupuesto_estimado.replace(",", "."))
+        except Exception:
+            presu = None
 
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -506,8 +417,9 @@ def create_pedido_full(payload: PedidoCreate) -> Dict[str, Any]:
                 )
                 RETURNING id, numero, created_at, updated_at
             """, (
-                sec_id, g.estado, g.fecha_pedido, g.fecha_desde, g.fecha_hasta,
-                g.presupuesto_estimado, g.observaciones, g.created_by_username
+                sec_id, (g.estado or "enviado"),
+                g.fecha_pedido, g.fecha_desde, g.fecha_hasta,
+                presu, g.observaciones, g.created_by_username
             ))
             ped = cur.fetchone()
             pedido_id = ped["id"]
@@ -516,35 +428,91 @@ def create_pedido_full(payload: PedidoCreate) -> Dict[str, Any]:
             cur.execute("""
                 INSERT INTO public.pedido_ambito (pedido_id, tipo)
                 VALUES (%s, %s)
-            """, (pedido_id, tipo_db))
+            """, (pedido_id, tipo_ambito_db))
 
-            if tipo_ui == "obra":
+            # (Opcional) detalles de obra/escuelas si vinieran en `especiales`
+            if ambitoIncluido == "obra" and body.especiales and body.especiales.get("obra_nombre"):
                 cur.execute("""
-                  INSERT INTO public.ambito_obra (pedido_id, nombre_obra)
-                  VALUES (%s, %s)
-                """, (pedido_id, a.obra.obra_nombre))
-            elif tipo_ui == "mantenimientodeescuelas":
+                    INSERT INTO public.ambito_obra (pedido_id, nombre_obra)
+                    VALUES (%s, %s)
+                """, (pedido_id, body.especiales["obra_nombre"]))
+            elif ambitoIncluido == "mantenimientodeescuelas" and body.especiales and body.especiales.get("escuela"):
                 cur.execute("""
-                  INSERT INTO public.ambito_mant_escuela (pedido_id, escuela)
-                  VALUES (%s, %s)
-                """, (pedido_id, a.escuelas.escuela))
+                    INSERT INTO public.ambito_mant_escuela (pedido_id, escuela)
+                    VALUES (%s, %s)
+                """, (pedido_id, body.especiales["escuela"]))
 
-            # 4) MÓDULO: insertar detalle según m.tipo (SERVICIOS actualizado)
-            if m.tipo == "servicios":
-                if m.tipo_servicio == "otros":
-                    cur.execute("""
-                        INSERT INTO public.pedido_servicios
-                          (pedido_id, tipo_servicio, servicio_requerido, destino_servicio)
-                        VALUES (%s, %s, %s, %s)
-                    """, (pedido_id, "otros", m.servicio_requerido, m.destino_servicio))
-                else:  # profesionales
+            # 4) Módulo según modulo_draft.modulo
+            m = md.modulo
+            p = md.payload or {}
+
+            if m == "servicios":
+                if p.get("tipo_profesional"):
                     cur.execute("""
                         INSERT INTO public.pedido_servicios
                           (pedido_id, tipo_servicio, tipo_profesional, dia_desde, dia_hasta)
                         VALUES (%s, %s, %s, %s, %s)
-                    """, (pedido_id, "profesionales", m.tipo_profesional, m.dia_desde, m.dia_hasta))
+                    """, (pedido_id, "profesionales", p.get("tipo_profesional"), p.get("dia_desde"), p.get("dia_hasta")))
+                else:
+                    cur.execute("""
+                        INSERT INTO public.pedido_servicios
+                          (pedido_id, tipo_servicio, servicio_requerido, destino_servicio)
+                        VALUES (%s, %s, %s, %s)
+                    """, (pedido_id, "otros", p.get("servicio_requerido"), p.get("destino_servicio")))
 
-            # (a futuro podés agregar bloques para alquiler/adquisicion/reparacion)
+            elif m == "alquiler":
+                cur.execute("""
+                    INSERT INTO public.pedido_alquiler
+                      (pedido_id, categoria, uso_edificio, ubicacion_edificio, uso_maquinaria, tipo_maquinaria,
+                       requiere_combustible, requiere_chofer, cronograma_desde, cronograma_hasta,
+                       horas_por_dia, que_alquilar, detalle_uso)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    pedido_id,
+                    p.get("categoria") or "otros",
+                    p.get("uso_edificio"), p.get("ubicacion_edificio"),
+                    p.get("uso_maquinaria"), p.get("tipo_maquinaria"),
+                    p.get("requiere_combustible"), p.get("requiere_chofer"),
+                    p.get("cronograma_desde"), p.get("cronograma_hasta"),
+                    p.get("horas_por_dia"), p.get("que_alquilar"), p.get("detalle_uso"),
+                ))
+
+            elif m == "adquisicion":
+                cur.execute("""
+                    INSERT INTO public.pedido_adquisicion (pedido_id, proposito, modo_adquisicion)
+                    VALUES (%s, %s, %s)
+                """, (pedido_id, p.get("proposito"), p.get("modo_adquisicion") or "uno"))
+                items: List[Dict[str, Any]] = p.get("items") or []
+                if items:
+                    cur.executemany("""
+                        INSERT INTO public.pedido_adquisicion_item
+                          (pedido_id, descripcion, cantidad, unidad, precio_unitario, total)
+                        VALUES (%s, %s, %s, %s, %s, COALESCE(%s, (COALESCE(%s,0) * COALESCE(%s,1))))
+                    """, [
+                        (
+                            pedido_id,
+                            it.get("descripcion"),
+                            it.get("cantidad") or 1,
+                            it.get("unidad"),
+                            it.get("precio_unitario"),
+                            None,
+                            it.get("precio_unitario"), it.get("cantidad") or 1
+                        )
+                        for it in items
+                    ])
+
+            elif m == "reparacion":
+                cur.execute("""
+                    INSERT INTO public.pedido_reparacion
+                      (pedido_id, tipo_reparacion, unidad_reparar, que_reparar, detalle_reparacion)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (
+                    pedido_id,
+                    p.get("tipo_reparacion") or "otros",
+                    p.get("unidad_reparar"),
+                    p.get("que_reparar"),
+                    p.get("detalle_reparacion"),
+                ))
 
             return {
                 "ok": True,
@@ -558,7 +526,7 @@ def create_pedido_full(payload: PedidoCreate) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"create_error: {e}")
 
 # =========================
-# Anexos (Supabase Storage) + transiciones automáticas de estado
+# Anexos (Supabase Storage) — SOLO presupuestos y anexo de obra (sin transiciones)
 # =========================
 def _sb_object_path(pedido_id: int, tipo_doc: str, filename: str) -> str:
     safe = (filename or "archivo.pdf").replace("/", "_").replace("\\", "_").strip()
@@ -567,13 +535,13 @@ def _sb_object_path(pedido_id: int, tipo_doc: str, filename: str) -> str:
 @router.post("/{pedido_id}/archivos")
 async def upload_archivo(
     pedido_id: int,
-    tipo_doc: str = Form(...),           # 'anexo1_obra' | 'formal_pdf' | 'presupuesto_1' | 'presupuesto_2' | 'expediente_1' | 'expediente_2'
+    tipo_doc: str = Form(...),           # 'presupuesto_1' | 'presupuesto_2' | 'anexo1_obra'
     archivo: UploadFile = File(...),     # clave "archivo" en multipart/form-data
 ):
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise HTTPException(status_code=500, detail="Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en el backend")
     if tipo_doc not in ALLOWED_TIPO_DOC:
-        raise HTTPException(status_code=400, detail=f"tipo_doc inválido: {tipo_doc}")
+        raise HTTPException(status_code=400, detail=f"tipo_doc inválido: {tipo_doc}. Permitidos: {', '.join(sorted(ALLOWED_TIPO_DOC))}")
     if not archivo.filename:
         raise HTTPException(status_code=400, detail="Falta nombre de archivo")
     mime = archivo.content_type or "application/pdf"
@@ -584,13 +552,13 @@ async def upload_archivo(
     if not data:
         raise HTTPException(status_code=400, detail="El archivo llegó vacío (0 bytes)")
 
-    # Verificar pedido existe
+    # Verificar pedido
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute("SELECT 1 FROM public.pedido WHERE id = %s;", (pedido_id,))
         if not cur.fetchone():
             raise HTTPException(status_code=404, detail="Pedido no encontrado")
 
-    # Subir a storage
+    # Subir a Storage
     object_key = _sb_object_path(pedido_id, tipo_doc, archivo.filename)
     upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{object_key}"
     async with httpx.AsyncClient(timeout=60) as client:
@@ -609,7 +577,7 @@ async def upload_archivo(
     storage_path = f"supabase://{SUPABASE_BUCKET}/{object_key}"
     size = len(data)
 
-    # Guardar metadatos en DB
+    # Guardar metadatos (sin transiciones de estado)
     sql = """
     INSERT INTO public.pedido_archivo
       (pedido_id, storage_path, file_name, content_type, bytes, tipo_doc)
@@ -627,28 +595,6 @@ async def upload_archivo(
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(sql, (pedido_id, storage_path, archivo.filename, mime, size, tipo_doc))
         row = cur.fetchone()
-        conn.commit()
-
-    # Transiciones automáticas según tipo_doc
-    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-        cur.execute("SELECT estado FROM public.pedido WHERE id=%s", (pedido_id,))
-        r = cur.fetchone()
-        if not r:
-            raise HTTPException(status_code=404, detail="Pedido no encontrado")
-        estado = r["estado"]
-
-        if tipo_doc == "formal_pdf":
-            if estado in ("borrador", "enviado", "en_revision", "aprobado"):
-                _set_estado(cur, pedido_id, "en_proceso", changed_by="upload:formal_pdf")
-
-        elif tipo_doc == "expediente_1":
-            if estado != "cerrado":
-                _set_estado(cur, pedido_id, "area_pago", changed_by="upload:expediente_1")
-
-        elif tipo_doc == "expediente_2":
-            if estado != "cerrado":
-                _set_estado(cur, pedido_id, "cerrado", changed_by="upload:expediente_2")
-
         conn.commit()
 
     return {"ok": True, "archivo_id": row["id"], "bytes": size, "path": storage_path}
@@ -729,7 +675,7 @@ async def download_redirect(archivo_id: int, expires_sec: int = 600):
 
     return RedirectResponse(url=signed_url, status_code=307)
 
-# Compat: endpoint anterior (clave "file"), delega al nuevo
+# Compat: endpoint anterior (clave "file"), delega al nuevo (solo anexo1_obra)
 @router.post("/{pedido_id}/archivos/anexo1_obra")
 async def upload_anexo1_obra(pedido_id: int, file: UploadFile = File(...)):
     return await upload_archivo(pedido_id=pedido_id, tipo_doc="anexo1_obra", archivo=file)

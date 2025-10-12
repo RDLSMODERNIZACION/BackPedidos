@@ -1,17 +1,16 @@
 # app/routes/archivos.py
 # Manejo de archivos (subir, listar, revisar, firmar/descargar) para TODOS los PDF:
-# - presupuesto_1 / presupuesto_2
+# - presupuesto_1 / presupuesto_2  (si se APRUEBA → pedido enviado → aprobado)
 # - anexo1_obra
-# - formal_pdf
+# - formal_pdf                     (si se APRUEBA → en_proceso)
 # - expediente_1 / expediente_2
 #
 # Versionado: cada upload crea SIEMPRE una nueva fila (no upsert).
-# No modifica estado del pedido (solo review_*).
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Header
 from fastapi.responses import RedirectResponse
 from fastapi.encoders import jsonable_encoder
-from typing import Optional, Any, List, Dict
+from typing import Optional, Any
 from psycopg.rows import dict_row
 from uuid import uuid4
 import os
@@ -60,18 +59,15 @@ async def upload_archivo(
     tipo_doc: str = Form(...),           # cualquiera de ALLOWED_TIPO_DOC
     archivo: UploadFile = File(...),     # clave "archivo" en multipart/form-data
 ):
-    # Validación de config
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise HTTPException(status_code=500, detail="Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en el backend")
 
-    # Validar tipo permitido
     if tipo_doc not in ALLOWED_TIPO_DOC:
         raise HTTPException(
             status_code=400,
             detail=f"tipo_doc inválido: {tipo_doc}. Permitidos: {', '.join(sorted(ALLOWED_TIPO_DOC))}"
         )
 
-    # Validar archivo
     if not archivo.filename:
         raise HTTPException(status_code=400, detail="Falta nombre de archivo")
     mime = archivo.content_type or "application/pdf"
@@ -88,7 +84,7 @@ async def upload_archivo(
         if not cur.fetchone():
             raise HTTPException(status_code=404, detail="Pedido no encontrado")
 
-    # Subir a Supabase Storage (uuid → versión nueva)
+    # Subir a Storage (uuid → versión nueva)
     object_key = _sb_object_path(pedido_id, tipo_doc, archivo.filename)
     upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{object_key}"
     async with httpx.AsyncClient(timeout=60) as client:
@@ -97,7 +93,7 @@ async def upload_archivo(
             headers={
                 "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
                 "Content-Type": mime,
-                "x-upsert": "true",  # sobre la misma ruta sobrescribe, pero usamos uuid → siempre nueva versión
+                "x-upsert": "true",  # el key es único por uuid → siempre versión nueva
             },
             content=data,
         )
@@ -168,7 +164,10 @@ def list_archivos_por_pedido(pedido_id: int):
         raise HTTPException(status_code=500, detail=f"list_archivos_error: {e}")
 
 # =========================
-# Review (aprobado / observado) — solo review_*, sin transiciones
+# Review (aprobado / observado)
+# Reglas:
+# - si decision == 'aprobado' y tipo_doc == 'presupuesto_*'  y estado actual == 'enviado'   → 'aprobado'
+# - si decision == 'aprobado' y tipo_doc == 'formal_pdf'                                    → 'en_proceso'
 # =========================
 @router.post("/{archivo_id}/review")
 def review_archivo(
@@ -183,12 +182,21 @@ def review_archivo(
 
     try:
         with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
-            # lock del archivo
-            cur.execute("SELECT pedido_id FROM public.pedido_archivo WHERE id = %s FOR UPDATE", (archivo_id,))
+            # 0) Bloquear fila del archivo y traer pedido_id + tipo_doc
+            cur.execute("""
+                SELECT pedido_id, tipo_doc
+                  FROM public.pedido_archivo
+                 WHERE id = %s
+                 FOR UPDATE
+            """, (archivo_id,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Archivo no encontrado")
 
+            pedido_id = row["pedido_id"]
+            tipo_doc  = (row["tipo_doc"] or "").lower()
+
+            # 1) Actualizar review_* del archivo
             cur.execute("""
                 UPDATE public.pedido_archivo
                    SET review_status = %s,
@@ -199,6 +207,65 @@ def review_archivo(
              RETURNING id, pedido_id, review_status, review_notes, reviewed_by, reviewed_at
             """, (decision, (notes or None), (x_user or "ui"), archivo_id))
             rv = cur.fetchone()
+
+            # 2) Transiciones según reglas
+            if decision == "aprobado":
+                # 2.a) presupuestos → enviado → aprobado
+                if tipo_doc in ("presupuesto_1", "presupuesto_2"):
+                    cur.execute("SELECT estado FROM public.pedido WHERE id = %s FOR UPDATE", (pedido_id,))
+                    p = cur.fetchone()
+                    if not p:
+                        raise HTTPException(status_code=404, detail="Pedido no encontrado")
+                    estado_anterior = p["estado"]
+                    if estado_anterior == "enviado":
+                        cur.execute("""
+                            UPDATE public.pedido
+                               SET estado = 'aprobado',
+                                   updated_at = now()
+                             WHERE id = %s
+                         RETURNING updated_at
+                        """, (pedido_id,))
+                        _ = cur.fetchone()
+                        cur.execute("""
+                            INSERT INTO public.pedido_historial
+                                (pedido_id, estado_anterior, estado_nuevo, motivo, changed_by)
+                            VALUES (%s, %s, %s, %s, %s)
+                        """, (
+                            pedido_id,
+                            estado_anterior,
+                            "aprobado",
+                            "aprobación de presupuesto",
+                            x_user or "ui",
+                        ))
+
+                # 2.b) formal_pdf → en_proceso
+                elif tipo_doc == "formal_pdf":
+                    cur.execute("SELECT estado FROM public.pedido WHERE id = %s FOR UPDATE", (pedido_id,))
+                    p = cur.fetchone()
+                    if not p:
+                        raise HTTPException(status_code=404, detail="Pedido no encontrado")
+                    estado_anterior = p["estado"]
+                    if estado_anterior != "en_proceso":
+                        cur.execute("""
+                            UPDATE public.pedido
+                               SET estado = 'en_proceso',
+                                   updated_at = now()
+                             WHERE id = %s
+                         RETURNING updated_at
+                        """, (pedido_id,))
+                        _ = cur.fetchone()
+                        cur.execute("""
+                            INSERT INTO public.pedido_historial
+                                (pedido_id, estado_anterior, estado_nuevo, motivo, changed_by)
+                            VALUES (%s, %s, %s, %s, %s)
+                        """, (
+                            pedido_id,
+                            estado_anterior,
+                            "en_proceso",
+                            "aprobación de formal_pdf",
+                            x_user or "ui",
+                        ))
+
             conn.commit()
 
         return jsonable_encoder(rv)

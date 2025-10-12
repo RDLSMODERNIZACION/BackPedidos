@@ -2,6 +2,7 @@
 # Endpoints de lectura para vistas:
 #   - public.v_pedido_info          → GET /ui/pedidos/{pedido_id:int}/info
 #   - public.v_ui_pedido_archivos   → GET /ui/pedidos/{pedido_id:int}/archivos
+#   - public.v_pedido_etapas        → GET /ui/pedidos/{pedido_id:int}/etapas
 # ------------------------------------------------------------------
 
 from fastapi import APIRouter, HTTPException
@@ -64,6 +65,23 @@ WHERE pedido_id = %s
 ORDER BY uploaded_at DESC NULLS LAST, id DESC
 """
 
+SQL_ETAPAS_BY_PEDIDO = """
+SELECT
+  pedido_id,
+  creado_at,
+  enviado_at,
+  en_revision_at,
+  aprobado_at,
+  en_proceso_at,
+  area_pago_at,
+  cerrado_at,
+  formal_pdf_at,
+  expediente_1_at,
+  expediente_2_at
+FROM public.v_pedido_etapas
+WHERE pedido_id = %s
+"""
+
 # ---------- Endpoints ----------
 
 @router.get("/pedidos/{pedido_id:int}/info")
@@ -118,3 +136,34 @@ def get_pedido_archivos(pedido_id: int):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"v_ui_pedido_archivos_error: {e}")
+
+@router.get("/pedidos/{pedido_id:int}/etapas")
+def get_pedido_etapas(pedido_id: int):
+    """
+    Fechas por etapa del trámite desde v_pedido_etapas.
+    Respuesta (si existe fila):
+      {
+        "pedido_id": ...,
+        "creado_at": ISO | null,
+        "enviado_at": ISO | null,
+        "en_revision_at": ISO | null,
+        "aprobado_at": ISO | null,
+        "en_proceso_at": ISO | null,
+        "area_pago_at": ISO | null,
+        "cerrado_at": ISO | null,
+        "formal_pdf_at": ISO | null,
+        "expediente_1_at": ISO | null,
+        "expediente_2_at": ISO | null
+      }
+    Si no hay fila, devuelve {}.
+    """
+    try:
+        with _get_conn() as con, con.cursor() as cur:
+            cur.execute(SQL_ETAPAS_BY_PEDIDO, (pedido_id,))
+            row = cur.fetchone()
+            if not row:
+                return jsonable_encoder({})
+            # fastapi jsonable_encoder ya serializa datetimes → ISO
+            return jsonable_encoder(row)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"v_pedido_etapas_error: {e}")

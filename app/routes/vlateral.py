@@ -1,6 +1,6 @@
 # app/routes/vlateral.py
 # Endpoints de lectura para las vistas:
-#   - public.v_pedido_detalle   → /ui/pedidos/{pedido_id}/full
+#   - public.v_pedido_detalle   → /ui/pedidos/{pedido_id:int}/full
 #   - public.v_pedido_overview  → /ui/pedidos/overview
 #
 # Listo para pegar en tu proyecto. No altera tablas.
@@ -60,7 +60,7 @@ SQL_OVERVIEW_ORDER = {
 
 # ---------- Endpoints ----------
 
-@router.get("/pedidos/{pedido_id}/full")
+@router.get("/pedidos/{pedido_id:int}/full")
 def get_pedido_full(
     pedido_id: int,
 ):
@@ -159,3 +159,28 @@ def get_pedidos_overview(
                 "q": q,
             }
         })
+
+
+# ---------- Aliases anti-colisión (útiles si hay otros routers con /ui/pedidos/{pedido_id}) ----------
+
+@router.get("/pedidos/_/overview")
+def get_pedidos_overview_alias(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    estado: Optional[
+        Literal["borrador", "enviado", "en_revision", "aprobado", "rechazado", "en_proceso", "area_pago", "cerrado"]
+    ] = Query(None),
+    secretaria_id: Optional[int] = Query(None),
+    q: Optional[str] = Query(None, description="Búsqueda por numero/solicitante/secretaria/modulo (ILIKE)"),
+    order: Optional[Literal["updated_desc", "created_desc", "total_desc", "total_asc"]] = Query("updated_desc"),
+):
+    # Reutiliza la lógica del endpoint principal
+    return get_pedidos_overview(limit, offset, estado, secretaria_id, q, order)
+
+
+@router.get("/pedidos/_/full-by-numero")
+def get_pedido_full_by_numero_alias(
+    numero: str = Query(..., description="Ej: EXP-2025-0042"),
+):
+    # Reutiliza la lógica del endpoint principal
+    return get_pedido_full_by_numero(numero)

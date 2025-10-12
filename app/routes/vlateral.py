@@ -1,17 +1,17 @@
 # app/routes/vlateral.py
 # Endpoints de lectura para las vistas:
-#   - public.v_pedido_detalle   → /ui/pedidos/{pedido_id:int}/full
+#   - public.v_pedido_detalle   → /ui/pedidos/{pedido_id:int}/full   (ahora hidrata módulos reales)
 #   - public.v_pedido_overview  → /ui/pedidos/overview
 #
 # Añadido:
-#   - Hidratación automática de modulo/modulo_payload
-#   - GET /ui/pedidos/{pedido_id:int}/modulo  (solo módulo)
-#
-# Listo para pegar. No altera tablas, solo consulta.
+#   - Escaneo de TODAS las tablas de módulos para hallar filas por pedido_id
+#   - GET /ui/pedidos/{pedido_id:int}/modulos (todos los módulos con filas)
+#   - Si hay >1 módulo con filas, además de modulo/modulo_payload, se agrega modulos_payload={...}
+# ------------------------------------------------------------------------------
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
-from typing import Optional, Literal, Tuple, List, Dict, Any
+from typing import Optional, Literal, Dict, Any, List, Tuple
 import os
 import psycopg
 from psycopg.rows import dict_row
@@ -29,24 +29,34 @@ def _db_url() -> str:
 def _get_conn():
     return psycopg.connect(_db_url(), row_factory=dict_row)
 
-# ---------- Módulos: detección de tabla ----------
+# ---------- Config módulos ----------
 
-# Candidatos por módulo. Ajustá nombres si tus tablas difieren.
+# Ajustá nombres si tus tablas difieren
 MODULE_CANDIDATES: Dict[str, List[str]] = {
     "servicios": [
-        "public.pedidos_servicios", "public.pedido_servicios", "public.servicios_pedido"
+        "public.pedido_servicios",
+        "public.pedidos_servicios",
+        "public.servicios_pedido",
     ],
     "alquiler": [
-        "public.pedidos_alquiler", "public.pedido_alquiler"
+        "public.pedido_alquiler",
+        "public.pedidos_alquiler",
     ],
     "adquisicion": [
-        "public.pedidos_adquisicion", "public.pedidos_adquisiciones", "public.adquisicion_pedido"
+        "public.pedidos_adquisicion",
+        "public.pedidos_adquisiciones",
+        "public.adquisicion_pedido",
     ],
     "reparacion": [
-        "public.pedidos_reparacion", "public.pedidos_reparaciones", "public.reparacion_pedido"
+        "public.pedido_reparacion",
+        "public.pedidos_reparacion",
+        "public.pedidos_reparaciones",
+        "public.reparacion_pedido",
     ],
     "obras": [
-        "public.pedidos_obras", "public.pedido_obras", "public.pedidos_obra"
+        "public.pedido_obras",
+        "public.pedidos_obras",
+        "public.pedidos_obra",
     ],
     "mantenimiento_escuelas": [
         "public.pedidos_mantenimiento_escuelas",
@@ -55,80 +65,75 @@ MODULE_CANDIDATES: Dict[str, List[str]] = {
     ],
 }
 
-def _to_regclass_exists(con, fqname: str) -> bool:
-    """Devuelve True si to_regclass(fqname) no es NULL."""
+def _regclass_exists(con, fqname: str) -> bool:
     with con.cursor() as cur:
-        cur.execute("SELECT to_regclass(%s) IS NOT NULL AS exists", (fqname,))
+        cur.execute("SELECT to_regclass(%s) IS NOT NULL AS ok", (fqname,))
         row = cur.fetchone()
-        return bool(row and row.get("exists"))
+        return bool(row and row.get("ok"))
 
-def _resolve_module_table(con, modulo: Optional[str]) -> Optional[Tuple[str, str]]:
-    """
-    Dado un modulo (p.ej. 'servicios'), encuentra la primera tabla existente.
-    Retorna (modulo_normalizado, table_name) o None si no encuentra.
-    """
-    if not modulo:
-        return None
-    key = modulo.strip().lower()
-    candidates = MODULE_CANDIDATES.get(key, [])
-    for fq in candidates:
-        if _to_regclass_exists(con, fq):
-            return key, fq
-    return None
-
-def _probe_any_existing_module_table(con) -> Optional[Tuple[str, str]]:
-    """
-    Si no viene 'modulo' en la vista, buscamos en TODAS las tablas candidatas
-    y devolvemos la primera que exista (encontrada por orden del dict).
-    """
-    for modulo, candidates in MODULE_CANDIDATES.items():
-        for fq in candidates:
-            if _to_regclass_exists(con, fq):
-                return modulo, fq
-    return None
-
-def _fetch_module_rows(con, table_fqname: str, pedido_id: int) -> List[Dict[str, Any]]:
-    """
-    Devuelve filas del módulo para el pedido dado. Asume columna 'pedido_id'.
-    """
-    sql = f"SELECT * FROM {table_fqname} WHERE pedido_id = %s"
+def _rows_for_table(con, fqname: str, pedido_id: int) -> List[Dict[str, Any]]:
+    # Asumimos columna pedido_id en tablas de módulos
+    sql = f"SELECT * FROM {fqname} WHERE pedido_id = %s"
     with con.cursor() as cur:
         cur.execute(sql, (pedido_id,))
-        rows = cur.fetchall()
-        return rows or []
+        return cur.fetchall() or []
 
-def _hydrate_modulo(con, base_row: Dict[str, Any]) -> Dict[str, Any]:
+def _scan_modules_for_pedido(con, pedido_id: int) -> Dict[str, Any]:
     """
-    Enriquecer base_row agregando 'modulo' (si falta) y 'modulo_payload' con
-    el/los registros del módulo correspondiente.
+    Recorre todas las tablas candidatas por módulo y devuelve
+    { modulo -> { 'table': fqname, 'rows': [...] } } solo para módulos con filas.
     """
-    if not base_row:
+    found: Dict[str, Any] = {}
+    for modulo, tables in MODULE_CANDIDATES.items():
+        for fq in tables:
+            if not _regclass_exists(con, fq):
+                continue
+            rows = _rows_for_table(con, fq, pedido_id)
+            if rows:
+                found[modulo] = {"table": fq, "rows": rows}
+                break  # si una de las variantes tuvo filas, no seguimos probando ese módulo
+    return found
+
+def _attach_module_payload(con, base_row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Adjunta modulo/modulo_payload si encuentra exactamente un módulo con filas.
+    Si encuentra varios, adjunta modulos_payload con todos y, como cortesía,
+    setea modulo/modulo_payload al primero (por compatibilidad).
+    """
+    if not base_row or not base_row.get("id"):
         return base_row
 
-    modulo = (base_row.get("modulo") or "") or None
-    pedido_id = base_row.get("id")
-    if not pedido_id:
-        return base_row
-
-    # Si ya vino payload desde la vista y no es nulo, lo respetamos
+    # Si ya viene un payload desde la vista, respetamos
     if base_row.get("modulo_payload"):
         return base_row
 
-    # Intentamos resolver por 'modulo' si existe; si no, probamos cualquiera
-    resolved = _resolve_module_table(con, modulo) or _probe_any_existing_module_table(con)
-    if not resolved:
+    pedido_id = int(base_row["id"])
+    found = _scan_modules_for_pedido(con, pedido_id)
+
+    if not found:
+        # No hay filas en ningún módulo para este pedido
         return base_row
 
-    modulo_key, table_fqname = resolved
-    rows = _fetch_module_rows(con, table_fqname, pedido_id)
-
-    # Si encontramos filas, adjuntamos
-    if rows:
-        # si antes venía null, asentamos módulo detectado
-        if not modulo:
-            base_row["modulo"] = modulo_key
-        # payload: si una sola fila, devolvemos objeto; si varias, lista
+    # Si hay uno solo módulo con filas → set directo
+    if len(found) == 1:
+        (modulo_key, info), = found.items()
+        rows = info["rows"]
+        base_row["modulo"] = base_row.get("modulo") or modulo_key
         base_row["modulo_payload"] = rows[0] if len(rows) == 1 else rows
+        # También devolvemos qué tabla fue
+        base_row["modulo_table"] = info["table"]
+        return base_row
+
+    # Si hay varios módulos con filas (escenario raro) → adjuntamos todos
+    base_row["modulos_payload"] = {
+        k: {"table": v["table"], "rows": v["rows"]} for k, v in found.items()
+    }
+    # Compat: elegimos el primero en orden alfabético para modulo/modulo_payload
+    first_key = sorted(found.keys())[0]
+    base_row["modulo"] = base_row.get("modulo") or first_key
+    first_rows = found[first_key]["rows"]
+    base_row["modulo_payload"] = first_rows[0] if len(first_rows) == 1 else first_rows
+    base_row["modulo_table"] = found[first_key]["table"]
     return base_row
 
 # ---------- SQL ----------
@@ -163,32 +168,30 @@ SQL_OVERVIEW_ORDER = {
 @router.get("/pedidos/{pedido_id:int}/full")
 def get_pedido_full(pedido_id: int):
     """
-    Devuelve un snapshot completo de un pedido (v_pedido_detalle) + modulo_payload hidratado.
+    Snapshot completo (v_pedido_detalle) + módulos reales (escanea todas las tablas candidatas).
     """
     with _get_conn() as con, con.cursor() as cur:
         cur.execute(SQL_DETALLE, (pedido_id,))
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail=f"Pedido {pedido_id} no encontrado")
-
-        row = _hydrate_modulo(con, dict(row))
-        return jsonable_encoder(row)
+        enriched = _attach_module_payload(con, dict(row))
+        return jsonable_encoder(enriched)
 
 @router.get("/pedidos/full-by-numero")
 def get_pedido_full_by_numero(
     numero: str = Query(..., description="Ej: EXP-2025-0042"),
 ):
     """
-    Variante por número de expediente (v_pedido_detalle) + modulo_payload hidratado.
+    Variante por número (v_pedido_detalle) + módulos reales.
     """
     with _get_conn() as con, con.cursor() as cur:
         cur.execute(SQL_DETALLE_BY_NUMERO, (numero,))
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail=f"Pedido {numero} no encontrado")
-
-        row = _hydrate_modulo(con, dict(row))
-        return jsonable_encoder(row)
+        enriched = _attach_module_payload(con, dict(row))
+        return jsonable_encoder(enriched)
 
 @router.get("/pedidos/overview")
 def get_pedidos_overview(
@@ -202,20 +205,17 @@ def get_pedidos_overview(
     order: Optional[Literal["updated_desc", "created_desc", "total_desc", "total_asc"]] = Query("updated_desc"),
 ):
     """
-    Listado liviano desde v_pedido_overview con filtros básicos y paginación.
-    (No hidrata módulo acá para mantenerlo rápido.)
+    Listado liviano desde v_pedido_overview (sin hidratar módulos para mantenerlo rápido).
     """
-    params = []
+    params: List[Any] = []
     sql = [SQL_OVERVIEW_BASE]
 
     if estado:
         sql.append("AND estado = %s")
         params.append(estado)
-
     if secretaria_id:
         sql.append("AND secretaria_id = %s")
         params.append(secretaria_id)
-
     if q:
         sql.append("""
             AND (
@@ -232,10 +232,8 @@ def get_pedidos_overview(
     sql.append("LIMIT %s OFFSET %s")
     params.extend([limit, offset])
 
-    final_sql = "\n".join(sql)
-
     with _get_conn() as con, con.cursor() as cur:
-        cur.execute(final_sql, tuple(params))
+        cur.execute("\n".join(sql), tuple(params))
         items = cur.fetchall()
         return jsonable_encoder({
             "items": items,
@@ -245,28 +243,23 @@ def get_pedidos_overview(
             "filters": {"estado": estado, "secretaria_id": secretaria_id, "q": q},
         })
 
-# ---------- Endpoint nuevo: solo módulo ----------
+# ---------- NUEVO: ver todos los módulos con filas ----------
 
-@router.get("/pedidos/{pedido_id:int}/modulo")
-def get_pedido_modulo(pedido_id: int):
+@router.get("/pedidos/{pedido_id:int}/modulos")
+def get_pedido_modulos(pedido_id: int):
     """
-    Devuelve únicamente {'modulo': <str>, 'payload': <obj|lista>, 'table': <fqname>} para un pedido.
+    Devuelve todos los módulos que tengan filas para este pedido:
+    {
+      "found": {
+        "servicios": { "table": "public.pedido_servicios", "rows": [...] },
+        "alquiler":  { "table": "...", "rows": [...] },
+        ...
+      }
+    }
     """
-    with _get_conn() as con, con.cursor() as cur:
-        cur.execute(SQL_DETALLE, (pedido_id,))
-        base = cur.fetchone()
-        if not base:
-            raise HTTPException(status_code=404, detail=f"Pedido {pedido_id} no encontrado")
-
-        modulo = (base.get("modulo") or "") or None
-        resolved = _resolve_module_table(con, modulo) or _probe_any_existing_module_table(con)
-        if not resolved:
-            return {"modulo": modulo, "payload": None, "table": None}
-
-        modulo_key, table_fqname = resolved
-        rows = _fetch_module_rows(con, table_fqname, pedido_id)
-        payload = rows[0] if len(rows) == 1 else rows
-        return jsonable_encoder({"modulo": modulo_key or modulo, "payload": payload, "table": table_fqname})
+    with _get_conn() as con:
+        found = _scan_modules_for_pedido(con, pedido_id)
+        return jsonable_encoder({"found": found})
 
 # ---------- Aliases anti-colisión ----------
 

@@ -3,7 +3,7 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles  # ⬅ para servir archivos
-from app.routes import auth, pedidos, ui     # ✅ unificado en routes
+from app.routes import auth, pedidos, ui, vlateral  # ✅ agregamos vlateral
 
 app = FastAPI(title="Dirac – Pedidos", version="1.0")
 
@@ -30,13 +30,14 @@ app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
 # ===== Routers =====
 app.include_router(auth.router)
 app.include_router(pedidos.router)
-app.include_router(ui.router)  # incluye /ui/pedidos/... y subida de formal_pdf
+app.include_router(ui.router)        # /ui/pedidos/... existentes
+app.include_router(vlateral.router)  # /ui/pedidos/overview y /ui/pedidos/{id}/full
 
 # ===== Health =====
 @app.get("/")
 def root():
-    return {"ok": True, "service": "Dirac – Pedidos API", "version": "1.0"}
+  return {"ok": True, "service": "Dirac – Pedidos API", "version": "1.0"}
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+  return {"ok": True}

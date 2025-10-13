@@ -6,7 +6,9 @@
 # - expediente_1                   (si se APRUEBA → area_pago)
 # - expediente_2                   (si se APRUEBA → cerrado)
 #
-# Versionado: cada upload crea SIEMPRE una nueva fila (no upsert).
+# Subida:
+# - Si (pedido_id, tipo_doc) NO existe → inserta una nueva fila
+# - Si (pedido_id, tipo_doc) YA existe → UPSERT (reemplaza metadatos y resetea review_*)
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Header
 from fastapi.responses import RedirectResponse
@@ -52,7 +54,7 @@ def _iso(dt: Optional[Any]) -> Optional[str]:
         return dt
 
 # =========================
-# Upload (nueva versión SIEMPRE)
+# Upload (UPSERT por (pedido_id, tipo_doc))
 # =========================
 @router.post("/{pedido_id}")
 async def upload_archivo(
@@ -87,7 +89,7 @@ async def upload_archivo(
         if not cur.fetchone():
             raise HTTPException(status_code=404, detail="Pedido no encontrado")
 
-    # Subir a Storage (uuid → versión nueva)
+    # Subir a Storage (uuid → versión nueva en el bucket)
     object_key = _sb_object_path(pedido_id, tipo_doc, archivo.filename)
     upload_url = "{}/storage/v1/object/{}/{}".format(SUPABASE_URL, SUPABASE_BUCKET, object_key)
     async with httpx.AsyncClient(timeout=60) as client:
@@ -106,19 +108,39 @@ async def upload_archivo(
     storage_path = "supabase://{}/{}".format(SUPABASE_BUCKET, object_key)
     size = len(data)
 
-    # Guardar metadatos (INSERT SIEMPRE → versión nueva)
-    sql = (
-        "INSERT INTO public.pedido_archivo "
-        "(pedido_id, storage_path, file_name, content_type, bytes, tipo_doc) "
-        "VALUES (%s, %s, %s, %s, %s, %s) "
-        "RETURNING id, created_at;"
-    )
+    # Guardar metadatos (UPSERT por (pedido_id, tipo_doc))
+    # - Reemplaza metadatos del archivo
+    # - Resetea el ciclo de revisión (review_* = NULL)
+    sql = """
+    INSERT INTO public.pedido_archivo
+      (pedido_id, storage_path, file_name, content_type, bytes, tipo_doc)
+    VALUES
+      (%s,        %s,           %s,        %s,           %s,    %s)
+    ON CONFLICT (pedido_id, tipo_doc)
+    DO UPDATE SET
+      storage_path = EXCLUDED.storage_path,
+      file_name    = EXCLUDED.file_name,
+      content_type = EXCLUDED.content_type,
+      bytes        = EXCLUDED.bytes,
+      created_at   = now(),
+      review_status = NULL,
+      review_notes  = NULL,
+      reviewed_by   = NULL,
+      reviewed_at   = NULL
+    RETURNING id, created_at;
+    """
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(sql, (pedido_id, storage_path, archivo.filename, mime, size, tipo_doc))
         row = cur.fetchone()
         conn.commit()
 
-    return {"ok": True, "archivo_id": row["id"], "bytes": size, "path": storage_path, "uploaded_at": _iso(row["created_at"])}
+    return {
+        "ok": True,
+        "archivo_id": row["id"],
+        "bytes": size,
+        "path": storage_path,
+        "uploaded_at": _iso(row["created_at"]),
+    }
 
 # =========================
 # Listar por pedido (vista)

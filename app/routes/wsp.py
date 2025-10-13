@@ -17,10 +17,10 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID_PROVEEDORES")  # emisor p/ proveedo
 WABA_DISPLAY_NUMBER = os.getenv("WABA_DISPLAY_NUMBER", "54911XXXXXXXX")  # para wa.me
 
 # ========== Verificación Webhook ==========
-VERIFY_TOKEN = os.getenv("WSP_VERIFY_TOKEN", "cambia-esto")
+VERIFY_TOKEN = os.getenv("WSP_VERIFY_TOKEN", "dirac-wsp-verif")
 
 # ========== Magic Link (JWT) ==========
-JWT_SECRET = os.getenv("WSP_LINK_SECRET", "cambia-esto")
+JWT_SECRET = os.getenv("WSP_LINK_SECRET", "Pandora2020")
 JWT_ISS = "dirac-wsp"
 JWT_AUD = "wsp_link"
 

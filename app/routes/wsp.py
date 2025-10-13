@@ -6,7 +6,7 @@
 import os, time, jwt, httpx
 from uuid import uuid4
 from urllib.parse import quote_plus
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
 # ========== Config WhatsApp Cloud API ==========
@@ -55,20 +55,27 @@ def _msisdn_plus(msisdn_from_webhook: str) -> str:
     """Meta envía 'from' sin '+'. Normalizamos a E.164 con '+'."""
     return msisdn_from_webhook if msisdn_from_webhook.startswith('+') else f'+{msisdn_from_webhook}'
 
+def _digits_only(e164: str) -> str:
+    """E.164 sin '+' (solo dígitos) para la API de envío."""
+    return ''.join(ch for ch in e164 if ch.isdigit())
+
 def send_text(to_msisdn_no_plus: str, text: str):
-    """Responder dentro de la ventana (gratis)."""
+    """Enviar texto por Cloud API (respuestas o notificaciones)."""
     if not (WSP_TOKEN and PHONE_NUMBER_ID):
         return
     url = f"{GRAPH}/{GRAPH_VERSION}/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WSP_TOKEN}"}
     body = {
         "messaging_product": "whatsapp",
-        "to": to_msisdn_no_plus,  # sin '+'
+        "to": _digits_only(to_msisdn_no_plus),  # Cloud API espera solo dígitos
         "type": "text",
-        "text": {"preview_url": False, "body": text[:4000]}
+        "text": {"preview_url": False, "body": text[:4000]},
     }
     with httpx.Client(timeout=15) as c:
-        c.post(url, json=body, headers=headers)
+        r = c.post(url, json=body, headers=headers)
+        if r.status_code >= 300:
+            # Log mínimo para depurar (no rompe el flujo)
+            print("WSP send error:", r.status_code, r.text)
 
 # ========== Magic link: crear ==========
 class MagicLinkReq(BaseModel):
@@ -96,9 +103,9 @@ def create_magic_link(body: MagicLinkReq):
 # ========== Webhook GET (verify) ==========
 @router.get("/webhook")
 def verify_webhook(request: Request):
-    params = request.query_params
-    if params.get("hub.mode") == "subscribe" and params.get("hub.verify_token") == VERIFY_TOKEN:
-        return int(params.get("hub.challenge", "0"))
+    p = request.query_params
+    if p.get("hub.mode") == "subscribe" and p.get("hub.verify_token") == VERIFY_TOKEN:
+        return Response(content=p.get("hub.challenge", "0"), media_type="text/plain")
     raise HTTPException(403, "Verify token inválido")
 
 # ========== Webhook POST (mensajes) ==========
@@ -163,9 +170,9 @@ def receive_webhook(payload: dict):
         rows = db_fetchall(
             """
             SELECT p.id, COALESCE(p.numero,'(s/n)'), p.estado, p.updated_at
-            FROM public.pedido p
-            JOIN public.provider_contacts pc
-              ON pc.proveedor_id = p.adjudicado_a AND pc.verified = TRUE
+            FROM public.pedido_proveedor pp
+            JOIN public.provider_contacts pc ON pc.proveedor_id = pp.proveedor_id AND pc.verified = TRUE
+            JOIN public.pedido p ON p.id = pp.pedido_id
             WHERE pc.msisdn = %s
             ORDER BY p.updated_at DESC
             LIMIT %s
@@ -174,7 +181,7 @@ def receive_webhook(payload: dict):
         )
 
         if not rows:
-            send_text(from_no_plus, "No tenés pedidos adjudicados.")
+            send_text(from_no_plus, "No tenés pedidos vinculados.")
         else:
             lines = [f"{r[1]} (ID {r[0]}) · {r[2]} · {r[3]:%Y-%m-%d}" for r in rows]
             send_text(from_no_plus, "Tus pedidos:\n" + "\n".join(lines))
@@ -188,9 +195,9 @@ def receive_webhook(payload: dict):
             row = db_fetchone(
                 """
                 SELECT p.id, COALESCE(p.numero,'(s/n)'), p.estado, p.updated_at
-                FROM public.pedido p
-                JOIN public.provider_contacts pc
-                  ON pc.proveedor_id = p.adjudicado_a AND pc.verified = TRUE
+                FROM public.pedido_proveedor pp
+                JOIN public.provider_contacts pc ON pc.proveedor_id = pp.proveedor_id AND pc.verified = TRUE
+                JOIN public.pedido p ON p.id = pp.pedido_id
                 WHERE pc.msisdn = %s AND p.id = %s
                 """,
                 (msisdn, pedido_id),
@@ -199,7 +206,7 @@ def receive_webhook(payload: dict):
                 pid, numero, estado, upd = row
                 send_text(from_no_plus, f"Pedido {numero} (ID {pid})\nEstado: {estado}\nActualizado: {upd:%Y-%m-%d %H:%M}")
             else:
-                send_text(from_no_plus, "No encuentro ese pedido.")
+                send_text(from_no_plus, "No encuentro ese pedido o no estás vinculado.")
         else:
             send_text(from_no_plus, "Formato: CONSULTAR PEDIDO <ID> (ej: CONSULTAR PEDIDO 49)")
         return {"ok": True}

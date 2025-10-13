@@ -485,6 +485,7 @@ def create_pedido_simple(body: PedidoV2) -> Dict[str, Any]:
 
             if m == "servicios":
                 if p.get("tipo_profesional"):
+                    # Guarda los días tal como vienen del front (strings), columnas TEXT en DB
                     cur.execute("""
                         INSERT INTO public.pedido_servicios
                           (pedido_id, tipo_servicio, tipo_profesional, dia_desde, dia_hasta)

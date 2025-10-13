@@ -2,54 +2,75 @@
 import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles  # ⬅ para servir archivos
+from fastapi.staticfiles import StaticFiles
 from fastapi.routing import APIRoute
 
-from app.routes import auth, pedidos, ui, vlateral, wsp, archivos  # ⬅ sumamos archivos
+from app.routes import auth, pedidos, ui, vlateral, wsp, archivos
 
-app = FastAPI(title="Dirac – Pedidos", version="1.0")
+APP_NAME = "Dirac – Pedidos API"
+APP_VER = "1.0"
 
-# ===== CORS =====
-origins_env = os.getenv("CORS_ORIGINS", "*")
-origins = [o.strip() for o in origins_env.split(",")] if origins_env else ["*"]
+app = FastAPI(title=APP_NAME, version=APP_VER)
+
+# =========================
+# CORS
+# =========================
+# CORS_ORIGINS puede ser:
+#   - "*" (comodín)
+#   - lista separada por comas (https://foo.com,https://bar.com)
+origins_env = (os.getenv("CORS_ORIGINS", "*") or "").strip()
+if origins_env == "*":
+    allow_origins = ["*"]
+    allow_credentials = False  # con "*" no se pueden credenciales; no hace falta para Authorization header
+else:
+    allow_origins = [o.strip() for o in origins_env.split(",") if o.strip()]
+    allow_credentials = True
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins if origins != ["*"] else ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],   # incluye OPTIONS
-    allow_headers=["*"],   # incluye Content-Type, Authorization, etc.
-    expose_headers=["Content-Disposition"],  # útil si querés descargar con nombre
+    allow_origins=allow_origins,
+    allow_credentials=allow_credentials,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    # Importante: permitir Authorization y X-User para tus endpoints de review/upload
+    allow_headers=["Authorization", "Content-Type", "X-User", "Accept", "Origin"],
+    expose_headers=["Content-Disposition"],  # útil para descargas con nombre
 )
 
-# ===== Archivos estáticos (PDFs firmados, anexos, etc.) =====
-# Config por env: FILES_DIR=files (default)
+# =========================
+# Archivos estáticos
+# =========================
+# Directorio local (si llegás a servir archivos locales además de Supabase)
 FILES_DIR = os.getenv("FILES_DIR", "files")
 os.makedirs(FILES_DIR, exist_ok=True)
-# Servimos todo lo que quede grabado allí (p.ej. /files/pedidos/<id>/formal.pdf)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
 
-# ===== Routers (orden importa) =====
-# 1) Rutas estáticas / deterministas primero
+# =========================
+# Routers (el orden puede importar)
+# =========================
+# 1) Rutas estáticas/deterministas
 app.include_router(wsp.router)         # /wsp/... (WhatsApp: webhook, magiclink)
-app.include_router(vlateral.router)    # /ui/... (info, etapas, archivos desde vistas)
+app.include_router(vlateral.router)    # /ui/... (info, etapas, vistas de lectura)
 
 # 2) Rutas de negocio
 app.include_router(archivos.router)    # /archivos/... (subir/listar/review/firmar/descargar)
-app.include_router(ui.router)          # /ui/pedidos/list, etc.
-app.include_router(pedidos.router)     # /pedidos (creación)
-app.include_router(auth.router)
+app.include_router(ui.router)          # /ui/pedidos/list, /ui/pedidos/{id}/info, etc.
+app.include_router(pedidos.router)     # /pedidos (creación y operaciones de pedidos)
+app.include_router(auth.router)        # /auth (si aplica)
 
-# ===== Health =====
+# =========================
+# Health & Root
+# =========================
 @app.get("/")
 def root():
-    return {"ok": True, "service": "Dirac – Pedidos API", "version": "1.0"}
+    return {"ok": True, "service": APP_NAME, "version": APP_VER}
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
-# ===== Diagnóstico de rutas (opcional) =====
+# =========================
+# Diagnóstico de rutas (opcional)
+# =========================
 @app.get("/__routes")
 def list_routes():
     out = []

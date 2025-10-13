@@ -9,10 +9,6 @@ from app.db import get_conn
 
 router = APIRouter(prefix="/ui", tags=["ui"])
 
-# =========================
-# Listado
-# =========================
-
 SortParam = Literal[
     "updated_at_desc", "updated_at_asc",
     "created_at_desc", "created_at_asc",
@@ -37,14 +33,7 @@ def ui_pedidos_list(
     estado: Optional[str] = Query(None, description="Filtra por estado exacto"),
     sort: SortParam = Query("updated_at_desc"),
 ) -> Dict[str, Any]:
-    """
-    Listado limpio (sin vistas) con:
-    id, id_tramite, secretaria, estado, total, creado, updated_at.
-
-    - total: SUM(pedido_adquisicion_item.total) (o cantidad*precio) si hay items; caso contrario, presupuesto_estimado.
-    - filtros: estado (exacto) y q (id_tramite/secretaria/estado).
-    - orden: updated_at/created_at/total (asc/desc).
-    """
+    """Listado desde la vista public.ui_pedidos_listado."""
     wh: List[str] = []
     params: Dict[str, Any] = {"limit": limit, "offset": offset}
 
@@ -60,59 +49,46 @@ def ui_pedidos_list(
         )""")
         params["q"] = f"%{q}%"
 
-    where_sql = "WHERE " + " AND ".join(wh) if wh else ""
+    where_sql = ("WHERE " + " AND ".join(wh)) if wh else ""
     order_sql = _sort_sql(sort)
 
     sql = f"""
-    WITH det AS (
-      SELECT
-        p.id,
-        p.numero AS id_tramite,
-        s.nombre AS secretaria,
-        p.estado,
-        COALESCE(
-          (
-            SELECT SUM(COALESCE(ai.total, ai.cantidad * COALESCE(ai.precio_unitario, 0)))::numeric
-            FROM public.pedido_adquisicion_item ai
-            WHERE ai.pedido_id = p.id
-          ),
-          p.presupuesto_estimado
-        ) AS total,
-        p.created_at AS creado,
-        p.updated_at
-      FROM public.pedido p
-      JOIN public.secretaria s ON s.id = p.secretaria_id
-    )
     SELECT *
     FROM (
-      SELECT det.*, COUNT(*) OVER() AS _total_count
-      FROM det
+      SELECT
+        v.id,
+        v.id_tramite,
+        v.secretaria,
+        v.estado,
+        v.total,         -- ← viene de la vista = presupuesto_estimado
+        v.creado,
+        v.updated_at,
+        COUNT(*) OVER() AS _total_count
+      FROM public.ui_pedidos_listado v
       {where_sql}
       {order_sql}
       LIMIT %(limit)s OFFSET %(offset)s
-    ) x
+    ) x;
     """
 
-    # Retry simple ante cierre inesperado de conexión
     for attempt in (1, 2):
         try:
             with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
-                total = rows[0]["_total_count"] if rows else 0
+                total_count = rows[0]["_total_count"] if rows else 0
                 for r in rows:
                     r.pop("_total_count", None)
                 return {
                     "items": rows,
-                    "count": total,
+                    "count": total_count,
                     "limit": limit,
                     "offset": offset,
                     "sort": sort,
                     "filters": {"q": q, "estado": estado},
                 }
         except (OperationalError, DatabaseError) as e:
-            msg = str(e)
-            if "server closed the connection unexpectedly" in msg and attempt == 1:
+            if "server closed the connection unexpectedly" in str(e) and attempt == 1:
                 time.sleep(0.3)
                 continue
             raise HTTPException(status_code=500, detail=f"Error listando pedidos: {e}")

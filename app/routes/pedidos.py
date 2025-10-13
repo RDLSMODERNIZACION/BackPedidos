@@ -5,7 +5,7 @@
 from fastapi import APIRouter, HTTPException, UploadFile, File, Query, Form
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
-from typing import Optional, Literal, List, Union, Dict, Any
+from typing import Optional, Literal, List, Dict, Any
 from psycopg.rows import dict_row
 from datetime import date
 import os
@@ -367,18 +367,25 @@ class V2ModuloDraft(BaseModel):
     modulo: Literal["servicios","alquiler","adquisicion","reparacion"]
     payload: Dict[str, Any]
 
+# v2: soporte explícito para 'ambito'
+class V2Ambito(BaseModel):
+    tipo: Literal["mantenimientodeescuelas","obra","ninguno"]
+    payload: Optional[Dict[str, Any]] = None
+
 class PedidoV2(BaseModel):
     generales: V2Generales
     modulo_seleccionado: Literal["servicios","alquiler","adquisicion","reparacion"]
     modulo_draft: V2ModuloDraft
     ambitoIncluido: Literal["ninguno","obra","mantenimientodeescuelas"]
     especiales: Optional[Dict[str, Any]] = None
+    ambito: Optional[V2Ambito] = None  # NUEVO: formato moderno
 
 @router.post("", status_code=201)
 def create_pedido_simple(body: PedidoV2) -> Dict[str, Any]:
     g = body.generales
     md = body.modulo_draft
     ambitoIncluido = body.ambitoIncluido
+    amb_v2 = body.ambito
 
     AMBITO_MAP = {
         "ninguno": "general",
@@ -393,7 +400,7 @@ def create_pedido_simple(body: PedidoV2) -> Dict[str, Any]:
         presu = float(g.presupuesto_estimado)
     elif isinstance(g.presupuesto_estimado, str):
         try:
-            presu = float(g.presupuesto_estimado.replace(",", "."))
+            presu = float(g.presupuesto_estimado.replace(",", ".")) if g.presupuesto_estimado else None
         except Exception:
             presu = None
 
@@ -424,23 +431,53 @@ def create_pedido_simple(body: PedidoV2) -> Dict[str, Any]:
             ped = cur.fetchone()
             pedido_id = ped["id"]
 
-            # 3) Ámbito
+            # 3) Ámbito: upsert en pedido_ambito y detalle (acepta v2 y compat)
             cur.execute("""
                 INSERT INTO public.pedido_ambito (pedido_id, tipo)
                 VALUES (%s, %s)
+                ON CONFLICT (pedido_id) DO UPDATE SET tipo = EXCLUDED.tipo
             """, (pedido_id, tipo_ambito_db))
 
-            # (Opcional) detalles de obra/escuelas si vinieran en `especiales`
-            if ambitoIncluido == "obra" and body.especiales and body.especiales.get("obra_nombre"):
-                cur.execute("""
-                    INSERT INTO public.ambito_obra (pedido_id, nombre_obra)
-                    VALUES (%s, %s)
-                """, (pedido_id, body.especiales["obra_nombre"]))
-            elif ambitoIncluido == "mantenimientodeescuelas" and body.especiales and body.especiales.get("escuela"):
-                cur.execute("""
-                    INSERT INTO public.ambito_mant_escuela (pedido_id, escuela)
-                    VALUES (%s, %s)
-                """, (pedido_id, body.especiales["escuela"]))
+            escuela = None
+            obra_nombre = None
+
+            if ambitoIncluido == "mantenimientodeescuelas":
+                # v2
+                if isinstance(amb_v2, dict):
+                    escuela = (amb_v2.get("payload") or {}).get("escuela")
+                else:
+                    escuela = getattr(getattr(amb_v2, "payload", None), "get", lambda *_: None)("escuela")
+                    if escuela is None and hasattr(amb_v2, "payload"):
+                        escuela = getattr(amb_v2.payload, "escuela", None)
+                # compat (plano y anidado)
+                if not escuela and body.especiales:
+                    escuela = body.especiales.get("escuela") or \
+                              (body.especiales.get("mantenimientodeescuelas") or {}).get("escuela")
+                if escuela:
+                    cur.execute("""
+                        INSERT INTO public.ambito_mant_escuela (pedido_id, escuela)
+                        VALUES (%s, %s)
+                        ON CONFLICT (pedido_id) DO UPDATE SET escuela = EXCLUDED.escuela
+                    """, (pedido_id, escuela))
+
+            elif ambitoIncluido == "obra":
+                # v2
+                if isinstance(amb_v2, dict):
+                    obra_nombre = (amb_v2.get("payload") or {}).get("obra_nombre")
+                else:
+                    obra_nombre = getattr(getattr(amb_v2, "payload", None), "get", lambda *_: None)("obra_nombre")
+                    if obra_nombre is None and hasattr(amb_v2, "payload"):
+                        obra_nombre = getattr(amb_v2.payload, "obra_nombre", None)
+                # compat (plano y anidado)
+                if not obra_nombre and body.especiales:
+                    obra_nombre = body.especiales.get("obra_nombre") or \
+                                  (body.especiales.get("obra") or {}).get("obra_nombre")
+                if obra_nombre:
+                    cur.execute("""
+                        INSERT INTO public.ambito_obra (pedido_id, nombre_obra)
+                        VALUES (%s, %s)
+                        ON CONFLICT (pedido_id) DO UPDATE SET nombre_obra = EXCLUDED.nombre_obra
+                    """, (pedido_id, obra_nombre))
 
             # 4) Módulo según modulo_draft.modulo
             m = md.modulo
@@ -577,7 +614,7 @@ async def upload_archivo(
     storage_path = f"supabase://{SUPABASE_BUCKET}/{object_key}"
     size = len(data)
 
-    # Guardar metadatos (sin transiciones de estado)
+    # Guardar metadatos (sin columnas de revisión ni transiciones)
     sql = """
     INSERT INTO public.pedido_archivo
       (pedido_id, storage_path, file_name, content_type, bytes, tipo_doc)

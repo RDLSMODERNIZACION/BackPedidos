@@ -4,6 +4,7 @@
 #   pip install fastapi httpx "psycopg[binary,pool]"
 
 import os, httpx, re
+from typing import Optional, List, Tuple
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 from psycopg_pool import ConnectionPool
@@ -34,6 +35,21 @@ if not DB_URL:
 POOL = ConnectionPool(DB_URL)
 
 # ========== Helpers ==========
+ESTADO_EMOJI = {
+    "borrador": "📝",
+    "enviado": "📤",
+    "en_revision": "🕵️",
+    "aprobado": "✅",
+    "rechazado": "❌",
+    "en_proceso": "🔧",
+    "area_pago": "💳",
+    "cerrado": "🏁",
+}
+
+def _estado_badge(estado: Optional[str]) -> str:
+    e = (estado or "").lower()
+    return f"{ESTADO_EMOJI.get(e, '📄')} {e.replace('_',' ') or 's/n'}"
+
 def _digits_only(s: str) -> str:
     return "".join(ch for ch in (s or "") if ch.isdigit())
 
@@ -41,6 +57,23 @@ def _msisdn_plus(from_meta: str) -> str:
     if not from_meta:
         return ""
     return from_meta if from_meta.startswith('+') else f'+{from_meta}'
+
+def _variants_plus(msisdn_plus: str) -> List[str]:
+    """Genera variantes +54... y +549... (Argentina) preservando orden, sin duplicados."""
+    d = _digits_only(msisdn_plus)
+    if not d:
+        return []
+    cand = [f'+{d}']
+    if d.startswith('549'):
+        cand.append(f'+54{d[3:]}')         # sin el 9
+    elif d.startswith('54') and not d.startswith('549'):
+        cand.append(f'+549{d[2:]}')        # con el 9
+    # dedup preservando orden
+    seen = set(); out = []
+    for x in cand:
+        if x not in seen:
+            seen.add(x); out.append(x)
+    return out
 
 def _require_env():
     missing = []
@@ -87,6 +120,7 @@ def _send_with_fallback(build_payload_fn, to_msisdn_no_plus: str):
     raise HTTPException(last_status or 400, str(last_err_text) if last_err_text else "send error")
 
 def send_text(to_msisdn_no_plus: str, text: str):
+    # WhatsApp no soporta "colores", usamos emojis y estructura clara
     def _builder(to_digits: str):
         return {
             "messaging_product": "whatsapp",
@@ -96,13 +130,77 @@ def send_text(to_msisdn_no_plus: str, text: str):
         }
     return _send_with_fallback(_builder, to_msisdn_no_plus)
 
-def _provider_id_for_msisdn(msisdn_plus: str) -> int | None:
-    if not msisdn_plus:
+def _provider_id_for_msisdn(msisdn_plus: str) -> Optional[int]:
+    variants = _variants_plus(msisdn_plus)
+    if not variants:
         return None
     with POOL.connection() as con, con.cursor() as cur:
-        cur.execute("SELECT id FROM public.proveedor WHERE telefono = %s LIMIT 1", (msisdn_plus,))
+        cur.execute("SELECT id FROM public.proveedor WHERE telefono = ANY(%s) LIMIT 1", (variants,))
         row = cur.fetchone()
         return row[0] if row else None
+
+def _fetch_mis_pedidos(prov_id: int, limit: int = 5) -> List[Tuple[int, str, str, object]]:
+    with POOL.connection() as con, con.cursor() as cur:
+        cur.execute("""
+          SELECT p.id, COALESCE(p.numero,'(s/n)'), p.estado, p.updated_at
+          FROM public.pedido_proveedor pp
+          JOIN public.pedido p ON p.id = pp.pedido_id
+          WHERE pp.proveedor_id = %s
+          ORDER BY p.updated_at DESC
+          LIMIT %s
+        """, (prov_id, limit))
+        return cur.fetchall()
+
+def _fetch_pedido_by_id(prov_id: int, pid: int):
+    with POOL.connection() as con, con.cursor() as cur:
+        cur.execute("""
+          SELECT p.id, COALESCE(p.numero,'(s/n)'), p.estado, p.updated_at
+          FROM public.pedido_proveedor pp
+          JOIN public.pedido p ON p.id = pp.pedido_id
+          WHERE pp.proveedor_id = %s AND p.id = %s
+        """, (prov_id, pid))
+        return cur.fetchone()
+
+def _fetch_pedido_by_num(prov_id: int, numero: str):
+    with POOL.connection() as con, con.cursor() as cur:
+        cur.execute("""
+          SELECT p.id, COALESCE(p.numero,'(s/n)'), p.estado, p.updated_at
+          FROM public.pedido_proveedor pp
+          JOIN public.pedido p ON p.id = pp.pedido_id
+          WHERE pp.proveedor_id = %s AND p.numero = %s
+        """, (prov_id, numero))
+        return cur.fetchone()
+
+def _pretty_menu() -> str:
+    return (
+        "🟩 *DIRAC · Proveedores*\n"
+        "Elegí una opción enviando el número o escribiendo el comando:\n"
+        "  1) 📋 *Mis pedidos* (opcional: `MIS PEDIDOS 5`)\n"
+        "  2) 🔎 *Consultar por Expediente*\n"
+        "     Ejemplos: `EXP-2025-0071`, `2 EXP-2025-0071`\n"
+        "  3) 🧾 *Consultar por ID*\n"
+        "     Ejemplos: `3 83`, `ID 83`, `#83`\n"
+        "\n"
+        "Tip: después de ver *Mis pedidos*, podés contestar solo el número de la lista (1–9) para ver el detalle. ✅"
+    )
+
+def _pretty_list(rows: List[Tuple[int,str,str,object]]) -> str:
+    if not rows:
+        return "😕 No tenés pedidos vinculados."
+    out = ["📋 *Tus pedidos (últimos actualizados)*"]
+    for i,(pid,num,estado,upd) in enumerate(rows, start=1):
+        out.append(f"{i}) *{num}* · ID {pid} · {_estado_badge(estado)} · {upd:%Y-%m-%d}")
+    out.append("\nRespondé el *número* (1–9) para ver el detalle, o mandá `menu` para volver.")
+    return "\n".join(out)
+
+def _pretty_detail(row: Tuple[int,str,str,object]) -> str:
+    pid, num, estado, upd = row
+    return (
+        f"🟦 *Detalle de expediente*\n"
+        f"*{num}* · ID {pid}\n"
+        f"Estado: {_estado_badge(estado)}\n"
+        f"Actualizado: {upd:%Y-%m-%d %H:%M}"
+    )
 
 # ========== Health ==========
 @router.get("/health")
@@ -143,87 +241,84 @@ def receive_webhook(payload: dict):
     except Exception:
         return {"ok": True}
     if "messages" not in changes:
-        return {"ok": True}
+        return {"ok": True"}
 
     msg = changes["messages"][0]
     from_no_plus = msg.get("from") or ""
-    msisdn = _msisdn_plus(from_no_plus)  # +542993251398 etc.
+    msisdn = _msisdn_plus(from_no_plus)  # +54... o +549...
     body = (msg.get("text", {}) or {}).get("body", "") or ""
-    UP = body.strip().upper()
+    raw = body.strip()
+    UP = raw.upper()
 
-    # Resolver proveedor por teléfono
+    # Resolver proveedor por teléfono (acepta +54 / +549)
     prov_id = _provider_id_for_msisdn(msisdn)
+    if prov_id is None:
+        send_text(from_no_plus, "⚠️ No encuentro un proveedor para este número. Pedí a Compras que registren tu teléfono.\n\n" + _pretty_menu())
+        return {"ok": False, "reason": "no_provider"}
 
-    # ---- DESVINCULAR (borra el teléfono de proveedor) ----
-    if UP.startswith("DESVINCULAR"):
-        with POOL.connection() as con, con.cursor() as cur:
-            cur.execute("UPDATE public.proveedor SET telefono = NULL WHERE telefono = %s", (msisdn,))
-            con.commit()
-        send_text(from_no_plus, "Listo. Este número fue desvinculado.")
+    # ======= Ruteo de comandos =======
+    # 0) MENU / AYUDA
+    if UP in ("MENU", "AYUDA", "HELP", "?"):
+        send_text(from_no_plus, _pretty_menu())
         return {"ok": True}
 
-    # ---- MIS PEDIDOS [N] ----
-    if UP.startswith("MIS PEDIDOS"):
-        if prov_id is None:
-            send_text(from_no_plus, "No encuentro un proveedor para este número. Pedí a Compras que te registren el teléfono.")
-            return {"ok": False, "reason": "no_provider"}
-
-        parts = UP.split()
+    # 1) MIS PEDIDOS [N]  — o número suelto 1..9 (selección del listado reciente)
+    # a) "MIS PEDIDOS" o "MIS PEDIDOS N" o "1"
+    m_mis = re.fullmatch(r"(MIS\s+PEDIDOS)(\s+(\d+))?$", UP)
+    if UP == "1" or m_mis:
         limit = 5
-        if len(parts) == 3 and parts[2].isdigit():
-            limit = max(1, min(10, int(parts[2])))
-
-        with POOL.connection() as con, con.cursor() as cur:
-            cur.execute("""
-              SELECT p.id, COALESCE(p.numero,'(s/n)'), p.estado, p.updated_at
-              FROM public.pedido_proveedor pp
-              JOIN public.pedido p ON p.id = pp.pedido_id
-              WHERE pp.proveedor_id = %s
-              ORDER BY p.updated_at DESC
-              LIMIT %s
-            """, (prov_id, limit))
-            rows = cur.fetchall()
-
-        if not rows:
-            send_text(from_no_plus, "No tenés pedidos vinculados.")
-        else:
-            lines = [f"{r[1]} (ID {r[0]}) · {r[2]} · {r[3]:%Y-%m-%d}" for r in rows]
-            send_text(from_no_plus, "Tus pedidos:\n" + "\n".join(lines))
+        if m_mis and m_mis.group(3) and m_mis.group(3).isdigit():
+            limit = max(1, min(9, int(m_mis.group(3))))
+        rows = _fetch_mis_pedidos(prov_id, limit=limit)
+        send_text(from_no_plus, _pretty_list(rows))
         return {"ok": True}
 
-    # ---- CONSULTAR PEDIDO <ID|NUMERO> ----
-    if UP.startswith("CONSULTAR PEDIDO"):
-        if prov_id is None:
-            send_text(from_no_plus, "No encuentro un proveedor para este número. Pedí a Compras que te registren el teléfono.")
-            return {"ok": False, "reason": "no_provider"}
+    # b) número suelto 1..9 -> interpreta como selección del TOP 9 por updated_at
+    if re.fullmatch(r"[1-9]", UP):
+        idx = int(UP)
+        rows = _fetch_mis_pedidos(prov_id, limit=9)
+        if 1 <= idx <= len(rows):
+            row = rows[idx-1]
+            send_text(from_no_plus, _pretty_detail(row))
+        else:
+            send_text(from_no_plus, "😕 Número fuera de rango. Escribí `menu` para ver opciones.")
+        return {"ok": True}
 
-        tail = body.split("CONSULTAR PEDIDO", 1)[1].strip()
-        is_id = re.fullmatch(r"\d+", tail) is not None
-
-        with POOL.connection() as con, con.cursor() as cur:
-            if is_id:
-                cur.execute("""
-                  SELECT p.id, COALESCE(p.numero,'(s/n)'), p.estado, p.updated_at
-                  FROM public.pedido_proveedor pp
-                  JOIN public.pedido p ON p.id = pp.pedido_id
-                  WHERE pp.proveedor_id = %s AND p.id = %s
-                """, (prov_id, int(tail)))
-            else:
-                cur.execute("""
-                  SELECT p.id, COALESCE(p.numero,'(s/n)'), p.estado, p.updated_at
-                  FROM public.pedido_proveedor pp
-                  JOIN public.pedido p ON p.id = pp.pedido_id
-                  WHERE pp.proveedor_id = %s AND p.numero = %s
-                """, (prov_id, tail))
-            row = cur.fetchone()
-
+    # 2) Consultar por EXP (acepta: "2 EXP-2025-0001" ó solo "EXP-2025-0001")
+    m_exp2 = re.fullmatch(r"2\s+([A-Z\-0-9/]+)", UP)
+    m_exp  = re.fullmatch(r"(EXP[\-\s]?\d{4}[\-\s]?\d+)", UP)  # EXP-2025-0071 / EXP 2025 0071
+    numero = None
+    if m_exp2:
+        numero = m_exp2.group(1).replace(" ", "").upper()
+    elif m_exp:
+        numero = m_exp.group(1).replace(" ", "").upper()
+    if numero:
+        # normalizar EXP-YYYY-XXXX
+        numero = numero.replace("EXP", "EXP-").replace("--","-")
+        numero = re.sub(r"EXP-?(\d{4})-?(\d+)", r"EXP-\1-\2", numero)
+        row = _fetch_pedido_by_num(prov_id, numero)
         if row:
-            pid, num, estado, upd = row
-            send_text(from_no_plus, f"Pedido {num} (ID {pid})\nEstado: {estado}\nActualizado: {upd:%Y-%m-%d %H:%M}")
+            send_text(from_no_plus, _pretty_detail(row))
         else:
-            send_text(from_no_plus, "No encuentro ese pedido o no está vinculado a tu CUIT.")
+            send_text(from_no_plus, f"🔎 No encuentro *{numero}* vinculado a tu CUIT.\nEscribí `menu` para ver opciones.")
         return {"ok": True}
 
-    # Fallback ayuda
-    send_text(from_no_plus, "Comandos:\n• MIS PEDIDOS [N]\n• CONSULTAR PEDIDO <ID|NUMERO>\n• DESVINCULAR")
+    # 3) Consultar por ID (acepta: "3 83", "ID 83", "#83")
+    m_id3 = re.fullmatch(r"3\s+(\d+)", UP)
+    m_id  = re.fullmatch(r"(?:ID|#)\s*(\d+)", UP)
+    m_only_digits = re.fullmatch(r"\d{2,}", UP)  # si manda solo dígitos (>=2) tratamos como ID
+    pid = None
+    if m_id3: pid = int(m_id3.group(1))
+    elif m_id: pid = int(m_id.group(1))
+    elif m_only_digits: pid = int(m_only_digits.group(0))
+    if pid is not None:
+        row = _fetch_pedido_by_id(prov_id, pid)
+        if row:
+            send_text(from_no_plus, _pretty_detail(row))
+        else:
+            send_text(from_no_plus, f"🔎 No encuentro *ID {pid}* vinculado a tu CUIT.\nEscribí `menu` para ver opciones.")
+        return {"ok": True}
+
+    # ===== Fallback: si no entendemos, mostramos el menú lindo =====
+    send_text(from_no_plus, "🤖 No entendí tu mensaje.\n\n" + _pretty_menu())
     return {"ok": True}

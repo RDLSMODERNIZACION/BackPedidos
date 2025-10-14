@@ -1,11 +1,9 @@
 # app/routes/wsp.py
-# WhatsApp Proveedores — Minimal + DB (test endpoints + magic link + webhook)
-# Requisitos: fastapi, httpx, PyJWT, psycopg[binary,pool]
-#   pip install fastapi httpx "psycopg[binary,pool]" PyJWT
+# WhatsApp Proveedores — flujo base por teléfono en proveedor (1 teléfono por proveedor)
+# Requisitos: fastapi, httpx, psycopg[binary,pool]
+#   pip install fastapi httpx "psycopg[binary,pool]"
 
-import os, time, jwt, httpx, re
-from uuid import uuid4
-from urllib.parse import quote_plus
+import os, httpx, re
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 from psycopg_pool import ConnectionPool
@@ -14,10 +12,10 @@ router = APIRouter(prefix="/wsp", tags=["whatsapp"])
 
 # ========== Config WhatsApp Cloud API ==========
 GRAPH = os.getenv("META_GRAPH_BASE", "https://graph.facebook.com")
-GRAPH_VERSION = os.getenv("META_GRAPH_VERSION", "v22.0")     # podés usar v21.0 si querés
-WSP_TOKEN = os.getenv("WSP_TOKEN")                            # Access token (Bearer)
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID_PROVEEDORES")    # Phone Number ID (test/prod)
-WABA_DISPLAY_NUMBER = os.getenv("WABA_DISPLAY_NUMBER", "15551630027")  # para wa.me (opcional)
+GRAPH_VERSION = os.getenv("META_GRAPH_VERSION", "v22.0")
+WSP_TOKEN = os.getenv("WSP_TOKEN")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID_PROVEEDORES")
+WABA_DISPLAY_NUMBER = os.getenv("WABA_DISPLAY_NUMBER", "15551630027")
 
 # ========== Webhook verify (GET) ==========
 VERIFY_TOKEN = os.getenv("WSP_VERIFY_TOKEN", "dirac-wsp-verify-20251013")
@@ -36,12 +34,10 @@ if not DB_URL:
 POOL = ConnectionPool(DB_URL)
 
 # ========== Helpers ==========
-def _digits_only(e164: str) -> str:
-    """E.164 sin '+' (solo dígitos) para la Cloud API."""
-    return "".join(ch for ch in e164 if ch.isdigit())
+def _digits_only(s: str) -> str:
+    return "".join(ch for ch in (s or "") if ch.isdigit())
 
 def _msisdn_plus(from_meta: str) -> str:
-    """Meta envía 'from' SIN '+'. Normalizamos a E.164 con '+'."""
     if not from_meta:
         return ""
     return from_meta if from_meta.startswith('+') else f'+{from_meta}'
@@ -54,64 +50,43 @@ def _require_env():
         raise HTTPException(500, f"Faltan variables de entorno: {', '.join(missing)}")
 
 def _post_once(payload: dict):
-    """Envía 1 payload. Devuelve (ok, json/text, status_code)."""
     url = f"{GRAPH}/{GRAPH_VERSION}/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WSP_TOKEN}"}
-    with httpx.Client(timeout=15) as c:
-        r = c.post(url, json=payload, headers=headers)
-        if r.status_code < 300:
-            try:
-                return True, r.json(), r.status_code
-            except Exception:
-                return True, r.text, r.status_code
-        return False, r.text, r.status_code
+    try:
+        with httpx.Client(timeout=15) as c:
+            r = c.post(url, json=payload, headers=headers)
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Error HTTP al llamar a Meta: {e}") from e
+    if r.status_code < 300:
+        try:
+            return True, r.json(), r.status_code
+        except Exception:
+            return True, r.text, r.status_code
+    return False, r.text, r.status_code
 
 def _candidate_to_variants(to_digits: str):
-    """
-    Genera variantes de destino para salvar whitelists raras (54/549/15).
-    Orden de intento:
-      - Si arranca con 549: [549..., 54...]
-      - Si arranca con 54 (y no 549): [54..., 549...]
-      - Si otra cosa: [to_digits]
-    """
-    variants = [to_digits]
+    # Maneja AR 54/549 automáticamente (evita 131030 cuando la allow-list no coincide)
     if to_digits.startswith("549"):
-        alt = "54" + to_digits[3:]  # dropear el 9
-        variants = [to_digits, alt]
-    elif to_digits.startswith("54") and not to_digits.startswith("549"):
-        alt = "549" + to_digits[2:]  # insertar el 9
-        variants = [to_digits, alt]
-    return variants
+        return [to_digits, "54" + to_digits[3:]]
+    if to_digits.startswith("54"):
+        return [to_digits, "549" + to_digits[2:]]
+    return [to_digits]
 
 def _send_with_fallback(build_payload_fn, to_msisdn_no_plus: str):
-    """
-    Intenta enviar a 549... y, si falla por (#131030) not-in-allowed-list,
-    reintenta con 54... (o viceversa). No cambia la DB.
-    """
     _require_env()
-    base_digits = _digits_only(to_msisdn_no_plus)
-    variants = _candidate_to_variants(base_digits)
-
-    last_err_text = None
-    last_status = None
-
+    digits = _digits_only(to_msisdn_no_plus)
+    variants = _candidate_to_variants(digits)
+    last_err_text = None; last_status = None
     for cand in variants:
-        payload = build_payload_fn(cand)
-        ok, data, status = _post_once(payload)
-        if ok:
-            return data
-        # Si es 131030 probamos siguiente candidato
+        ok, data, status = _post_once(build_payload_fn(cand))
+        if ok: return data
         if "131030" in str(data) or "not in allowed list" in str(data).lower():
             last_err_text, last_status = data, status
             continue
-        # Otro error: devolvemos tal cual
         raise HTTPException(status, str(data))
-
-    # Si agotamos variantes, devolvemos el último error (probablemente 131030)
     raise HTTPException(last_status or 400, str(last_err_text) if last_err_text else "send error")
 
 def send_text(to_msisdn_no_plus: str, text: str):
-    """Enviar texto con fallback 549/54."""
     def _builder(to_digits: str):
         return {
             "messaging_product": "whatsapp",
@@ -121,16 +96,18 @@ def send_text(to_msisdn_no_plus: str, text: str):
         }
     return _send_with_fallback(_builder, to_msisdn_no_plus)
 
-# ========== Health check ==========
+def _provider_id_for_msisdn(msisdn_plus: str) -> int | None:
+    if not msisdn_plus:
+        return None
+    with POOL.connection() as con, con.cursor() as cur:
+        cur.execute("SELECT id FROM public.proveedor WHERE telefono = %s LIMIT 1", (msisdn_plus,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+# ========== Health ==========
 @router.get("/health")
 def health():
-    return {
-        "ok": True,
-        "graph": GRAPH,
-        "version": GRAPH_VERSION,
-        "has_token": bool(WSP_TOKEN),
-        "has_phone_id": bool(PHONE_NUMBER_ID),
-    }
+    return {"ok": True, "graph": GRAPH, "version": GRAPH_VERSION, "has_token": bool(WSP_TOKEN), "has_phone_id": bool(PHONE_NUMBER_ID)}
 
 # ========== Endpoints DE PRUEBA ==========
 class SendTextReq(BaseModel):
@@ -148,7 +125,6 @@ class SendTemplateReq(BaseModel):
 
 @router.post("/test/template")
 def send_template_minimal(body: SendTemplateReq):
-    """Envía plantilla con fallback 549/54."""
     def _builder(to_digits: str):
         return {
             "messaging_product": "whatsapp",
@@ -158,84 +134,40 @@ def send_template_minimal(body: SendTemplateReq):
         }
     return _send_with_fallback(_builder, body.to)
 
-# ========== Magic link (JWT) ==========
-JWT_SECRET = os.getenv("WSP_LINK_SECRET", "QxZCk8q9Yp3w7L1nT4v6Rg2sF8m0Jd5Kc9Ub3Xe7Ha1Nr4Vt6Wz2Py8Ql0So5Tu")
-JWT_ISS = "dirac-wsp"
-JWT_AUD = "wsp_link"
-
-class MagicLinkReq(BaseModel):
-    provider_id: int
-
-@router.post("/magiclink")
-def create_magic_link(body: MagicLinkReq):
-    now = int(time.time())
-    exp = now + 10 * 60
-    jti = str(uuid4())
-    payload = {"iss": JWT_ISS, "aud": JWT_AUD, "iat": now, "exp": exp, "jti": jti, "provider_id": body.provider_id}
-    token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
-    with POOL.connection() as con, con.cursor() as cur:
-        cur.execute("INSERT INTO public.wsp_link_tokens (jti, provider_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-                    (jti, body.provider_id))
-        con.commit()
-    text = f"VINCULAR {token}"
-    link = f"https://wa.me/{WABA_DISPLAY_NUMBER}?text={quote_plus(text)}"
-    return {"link": link, "expires_in_sec": 600}
-
-# ========== Webhook (POST) — identidad + comandos ==========
+# ========== Webhook ==========
 @router.post("/webhook")
 def receive_webhook(payload: dict):
+    # Estructura básica de Webhook de Meta
     try:
         changes = payload["entry"][0]["changes"][0]["value"]
     except Exception:
         return {"ok": True}
-
     if "messages" not in changes:
         return {"ok": True}
 
     msg = changes["messages"][0]
-    from_no_plus = msg.get("from") or ""     # ej: 549299...
-    msisdn = _msisdn_plus(from_no_plus)      # +549299...
+    from_no_plus = msg.get("from") or ""
+    msisdn = _msisdn_plus(from_no_plus)  # +542993251398 etc.
     body = (msg.get("text", {}) or {}).get("body", "") or ""
     UP = body.strip().upper()
 
-    # Touch actividad
-    with POOL.connection() as con, con.cursor() as cur:
-        cur.execute("UPDATE public.provider_contacts SET last_seen_at = now() WHERE msisdn = %s", (msisdn,))
-        con.commit()
+    # Resolver proveedor por teléfono
+    prov_id = _provider_id_for_msisdn(msisdn)
 
-    # ---- VINCULAR <token> ----
-    if UP.startswith("VINCULAR "):
-        token = body.split(" ", 1)[1].strip()
-        try:
-            data = jwt.decode(token, JWT_SECRET, algorithms=["HS256"], audience=JWT_AUD, issuer=JWT_ISS)
-        except Exception:
-            send_text(from_no_plus, "Token inválido o vencido. Volvé a generar el enlace desde el portal.")
-            return {"ok": False, "reason": "bad_token"}
-        jti = data["jti"]; provider_id = int(data["provider_id"])
-
+    # ---- DESVINCULAR (borra el teléfono de proveedor) ----
+    if UP.startswith("DESVINCULAR"):
         with POOL.connection() as con, con.cursor() as cur:
-            # antireplay
-            cur.execute("SELECT consumed_at FROM public.wsp_link_tokens WHERE jti=%s", (jti,))
-            row = cur.fetchone()
-            if row and row[0] is not None:
-                send_text(from_no_plus, "Ese enlace ya fue usado. Generá uno nuevo.")
-                return {"ok": False, "reason": "replay"}
-
-            # upsert contacto
-            cur.execute("""
-              INSERT INTO public.provider_contacts (proveedor_id, msisdn, verified, last_seen_at)
-              VALUES (%s, %s, TRUE, now())
-              ON CONFLICT (proveedor_id, msisdn)
-              DO UPDATE SET verified=TRUE, last_seen_at=now()
-            """, (provider_id, msisdn))
-            cur.execute("UPDATE public.wsp_link_tokens SET consumed_at = now() WHERE jti=%s", (jti,))
+            cur.execute("UPDATE public.proveedor SET telefono = NULL WHERE telefono = %s", (msisdn,))
             con.commit()
-
-        send_text(from_no_plus, "Listo ✅ Tu WhatsApp quedó vinculado. Comandos: MIS PEDIDOS, CONSULTAR PEDIDO <ID|NUMERO>, DESVINCULAR")
+        send_text(from_no_plus, "Listo. Este número fue desvinculado.")
         return {"ok": True}
 
     # ---- MIS PEDIDOS [N] ----
     if UP.startswith("MIS PEDIDOS"):
+        if prov_id is None:
+            send_text(from_no_plus, "No encuentro un proveedor para este número. Pedí a Compras que te registren el teléfono.")
+            return {"ok": False, "reason": "no_provider"}
+
         parts = UP.split()
         limit = 5
         if len(parts) == 3 and parts[2].isdigit():
@@ -245,12 +177,11 @@ def receive_webhook(payload: dict):
             cur.execute("""
               SELECT p.id, COALESCE(p.numero,'(s/n)'), p.estado, p.updated_at
               FROM public.pedido_proveedor pp
-              JOIN public.provider_contacts pc ON pc.proveedor_id = pp.proveedor_id AND pc.verified = TRUE
               JOIN public.pedido p ON p.id = pp.pedido_id
-              WHERE pc.msisdn = %s
+              WHERE pp.proveedor_id = %s
               ORDER BY p.updated_at DESC
               LIMIT %s
-            """, (msisdn, limit))
+            """, (prov_id, limit))
             rows = cur.fetchall()
 
         if not rows:
@@ -262,46 +193,35 @@ def receive_webhook(payload: dict):
 
     # ---- CONSULTAR PEDIDO <ID|NUMERO> ----
     if UP.startswith("CONSULTAR PEDIDO"):
-        pedido_id = None
-        numero = None
+        if prov_id is None:
+            send_text(from_no_plus, "No encuentro un proveedor para este número. Pedí a Compras que te registren el teléfono.")
+            return {"ok": False, "reason": "no_provider"}
+
         tail = body.split("CONSULTAR PEDIDO", 1)[1].strip()
-        if re.fullmatch(r"\d+", tail):
-            pedido_id = int(tail)
-        else:
-            numero = tail
+        is_id = re.fullmatch(r"\d+", tail) is not None
 
         with POOL.connection() as con, con.cursor() as cur:
-            if pedido_id is not None:
+            if is_id:
                 cur.execute("""
                   SELECT p.id, COALESCE(p.numero,'(s/n)'), p.estado, p.updated_at
                   FROM public.pedido_proveedor pp
-                  JOIN public.provider_contacts pc ON pc.proveedor_id = pp.proveedor_id AND pc.verified = TRUE
                   JOIN public.pedido p ON p.id = pp.pedido_id
-                  WHERE pc.msisdn = %s AND p.id = %s
-                """, (msisdn, pedido_id))
+                  WHERE pp.proveedor_id = %s AND p.id = %s
+                """, (prov_id, int(tail)))
             else:
                 cur.execute("""
                   SELECT p.id, COALESCE(p.numero,'(s/n)'), p.estado, p.updated_at
                   FROM public.pedido_proveedor pp
-                  JOIN public.provider_contacts pc ON pc.proveedor_id = pp.proveedor_id AND pc.verified = TRUE
                   JOIN public.pedido p ON p.id = pp.pedido_id
-                  WHERE pc.msisdn = %s AND p.numero = %s
-                """, (msisdn, numero))
+                  WHERE pp.proveedor_id = %s AND p.numero = %s
+                """, (prov_id, tail))
             row = cur.fetchone()
 
         if row:
             pid, num, estado, upd = row
             send_text(from_no_plus, f"Pedido {num} (ID {pid})\nEstado: {estado}\nActualizado: {upd:%Y-%m-%d %H:%M}")
         else:
-            send_text(from_no_plus, "No encuentro ese pedido o no estás vinculado.")
-        return {"ok": True}
-
-    # ---- DESVINCULAR ----
-    if UP.startswith("DESVINCULAR"):
-        with POOL.connection() as con, con.cursor() as cur:
-            cur.execute("DELETE FROM public.provider_contacts WHERE msisdn=%s", (msisdn,))
-            con.commit()
-        send_text(from_no_plus, "Listo. Tu número fue desvinculado.")
+            send_text(from_no_plus, "No encuentro ese pedido o no está vinculado a tu CUIT.")
         return {"ok": True}
 
     # Fallback ayuda

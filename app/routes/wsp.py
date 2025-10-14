@@ -14,7 +14,7 @@ router = APIRouter(prefix="/wsp", tags=["whatsapp"])
 
 # ========== Config WhatsApp Cloud API ==========
 GRAPH = os.getenv("META_GRAPH_BASE", "https://graph.facebook.com")
-GRAPH_VERSION = os.getenv("META_GRAPH_VERSION", "v22.0")     # alineado con tu cURL
+GRAPH_VERSION = os.getenv("META_GRAPH_VERSION", "v22.0")     # podés usar v21.0 si querés
 WSP_TOKEN = os.getenv("WSP_TOKEN")                            # Access token (Bearer)
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID_PROVEEDORES")    # Phone Number ID (test/prod)
 WABA_DISPLAY_NUMBER = os.getenv("WABA_DISPLAY_NUMBER", "15551630027")  # para wa.me (opcional)
@@ -47,29 +47,73 @@ def _require_env():
     if missing:
         raise HTTPException(500, f"Faltan variables de entorno: {', '.join(missing)}")
 
-def _post_to_whatsapp(payload: dict):
+def _post_once(payload: dict):
+    """Envía 1 payload. Devuelve (ok, json/text, status_code)."""
     url = f"{GRAPH}/{GRAPH_VERSION}/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WSP_TOKEN}"}
     with httpx.Client(timeout=15) as c:
         r = c.post(url, json=payload, headers=headers)
-        if r.status_code >= 300:
-            # Propagamos el error literal (131030, 190, etc.)
-            raise HTTPException(r.status_code, r.text)
-        return r.json()
+        if r.status_code < 300:
+            try:
+                return True, r.json(), r.status_code
+            except Exception:
+                return True, r.text, r.status_code
+        return False, r.text, r.status_code
+
+def _candidate_to_variants(to_digits: str):
+    """
+    Genera variantes de destino para salvar whitelists raras (54/549/15).
+    Orden de intento:
+      - Si arranca con 549: [549..., 54...]
+      - Si arranca con 54 (y no 549): [54..., 549...]
+      - Si otra cosa: [to_digits]
+    """
+    variants = [to_digits]
+    if to_digits.startswith("549"):
+        alt = "54" + to_digits[3:]  # dropear el 9
+        variants = [to_digits, alt]
+    elif to_digits.startswith("54") and not to_digits.startswith("549"):
+        alt = "549" + to_digits[2:]  # insertar el 9
+        variants = [to_digits, alt]
+    return variants
+
+def _send_with_fallback(build_payload_fn, to_msisdn_no_plus: str):
+    """
+    Intenta enviar a 549... y, si falla por (#131030) not-in-allowed-list,
+    reintenta con 54... (o viceversa). No cambia la DB.
+    """
+    _require_env()
+    base_digits = _digits_only(to_msisdn_no_plus)
+    variants = _candidate_to_variants(base_digits)
+
+    last_err_text = None
+    last_status = None
+
+    for cand in variants:
+        payload = build_payload_fn(cand)
+        ok, data, status = _post_once(payload)
+        if ok:
+            return data
+        # Si es 131030 probamos siguiente candidato
+        if "131030" in str(data) or "not in allowed list" in str(data).lower():
+            last_err_text, last_status = data, status
+            continue
+        # Otro error: devolvemos tal cual
+        raise HTTPException(status, str(data))
+
+    # Si agotamos variantes, devolvemos el último error (probablemente 131030)
+    raise HTTPException(last_status or 400, str(last_err_text) if last_err_text else "send error")
 
 def send_text(to_msisdn_no_plus: str, text: str):
-    """Enviar texto (usa _post_to_whatsapp)."""
-    _require_env()
-    return _post_to_whatsapp({
-        "messaging_product": "whatsapp",
-        "to": _digits_only(to_msisdn_no_plus),
-        "type": "text",
-        "text": {"preview_url": False, "body": text[:4000]},
-    })
-
-def _msisdn_plus(from_meta: str) -> str:
-    """Meta manda 'from' sin '+'. Normalizamos."""
-    return from_meta if from_meta.startswith('+') else f'+{from_meta}'
+    """Enviar texto con fallback 549/54."""
+    def _builder(to_digits: str):
+        return {
+            "messaging_product": "whatsapp",
+            "to": to_digits,
+            "type": "text",
+            "text": {"preview_url": False, "body": text[:4000]},
+        }
+    return _send_with_fallback(_builder, to_msisdn_no_plus)
 
 # ========== Health check ==========
 @router.get("/health")
@@ -82,20 +126,14 @@ def health():
         "has_phone_id": bool(PHONE_NUMBER_ID),
     }
 
-# ========== Endpoints DE PRUEBA (los tuyos, intactos) ==========
+# ========== Endpoints DE PRUEBA ==========
 class SendTextReq(BaseModel):
     to: str
     text: str = "Prueba Dirac ✅ — hola!"
 
 @router.post("/test/text")
 def send_text_minimal(body: SendTextReq):
-    _require_env()
-    return _post_to_whatsapp({
-        "messaging_product": "whatsapp",
-        "to": _digits_only(body.to),
-        "type": "text",
-        "text": {"preview_url": False, "body": body.text[:4000]},
-    })
+    return send_text(body.to, body.text)
 
 class SendTemplateReq(BaseModel):
     to: str
@@ -104,13 +142,15 @@ class SendTemplateReq(BaseModel):
 
 @router.post("/test/template")
 def send_template_minimal(body: SendTemplateReq):
-    _require_env()
-    return _post_to_whatsapp({
-        "messaging_product": "whatsapp",
-        "to": _digits_only(body.to),
-        "type": "template",
-        "template": {"name": body.template_name, "language": {"code": body.language_code}},
-    })
+    """Envía plantilla con fallback 549/54."""
+    def _builder(to_digits: str):
+        return {
+            "messaging_product": "whatsapp",
+            "to": to_digits,
+            "type": "template",
+            "template": {"name": body.template_name, "language": {"code": body.language_code}},
+        }
+    return _send_with_fallback(_builder, body.to)
 
 # ========== Magic link (JWT) ==========
 JWT_SECRET = os.getenv("WSP_LINK_SECRET", "QxZCk8q9Yp3w7L1nT4v6Rg2sF8m0Jd5Kc9Ub3Xe7Ha1Nr4Vt6Wz2Py8Ql0So5Tu")
@@ -175,7 +215,7 @@ def receive_webhook(payload: dict):
                 send_text(from_no_plus, "Ese enlace ya fue usado. Generá uno nuevo.")
                 return {"ok": False, "reason": "replay"}
 
-            # upsert contacto (requiere índice único (proveedor_id, msisdn) que ya creaste)
+            # upsert contacto
             cur.execute("""
               INSERT INTO public.provider_contacts (proveedor_id, msisdn, verified, last_seen_at)
               VALUES (%s, %s, TRUE, now())

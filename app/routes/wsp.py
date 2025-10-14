@@ -40,6 +40,12 @@ def _digits_only(e164: str) -> str:
     """E.164 sin '+' (solo dígitos) para la Cloud API."""
     return "".join(ch for ch in e164 if ch.isdigit())
 
+def _msisdn_plus(from_meta: str) -> str:
+    """Meta envía 'from' SIN '+'. Normalizamos a E.164 con '+'."""
+    if not from_meta:
+        return ""
+    return from_meta if from_meta.startswith('+') else f'+{from_meta}'
+
 def _require_env():
     missing = []
     if not WSP_TOKEN: missing.append("WSP_TOKEN")

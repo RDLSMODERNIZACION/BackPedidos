@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.routing import APIRoute
 
-from app.routes import auth, pedidos, ui, vlateral, wsp, archivos, proveedores
+from app.routes import auth, pedidos, ui, vlateral, wsp, archivos, proveedores, pedidos_acciones
 from app.db import open_pool, close_pool, get_pool  # ✅ pool único
 
 APP_NAME = "Dirac – Pedidos API"
@@ -18,25 +18,19 @@ app = FastAPI(title=APP_NAME, version=APP_VER)
 # =========================
 @app.on_event("startup")
 def _on_startup():
-    # abre 1 solo pool global para todo el proceso (evita MaxClientsInSessionMode)
-    open_pool()
+    open_pool()  # abre 1 solo pool global
 
 @app.on_event("shutdown")
 def _on_shutdown():
-    # cierra el pool prolijo
-    close_pool()
+    close_pool()  # cierra el pool prolijo
 
 # =========================
 # CORS
 # =========================
-# CORS_ORIGINS puede ser:
-#   - "*" (comodín)
-#   - lista separada por comas (https://foo.com,https://bar.com)
 origins_env = (os.getenv("CORS_ORIGINS", "*") or "").strip()
 if origins_env == "*":
     allow_origins = ["*"]
-    # con "*" no se pueden credenciales; no hace falta para Authorization header
-    allow_credentials = False
+    allow_credentials = False  # con "*" no se envían credenciales
 else:
     allow_origins = [o.strip() for o in origins_env.split(",") if o.strip()]
     allow_credentials = True
@@ -46,15 +40,13 @@ app.add_middleware(
     allow_origins=allow_origins,
     allow_credentials=allow_credentials,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    # Importante: permitir Authorization y X-User para tus endpoints de review/upload
     allow_headers=["Authorization", "Content-Type", "X-User", "Accept", "Origin"],
-    expose_headers=["Content-Disposition"],  # útil para descargas con nombre
+    expose_headers=["Content-Disposition"],
 )
 
 # =========================
 # Archivos estáticos
 # =========================
-# Directorio local (si llegás a servir archivos locales además de Supabase)
 FILES_DIR = os.getenv("FILES_DIR", "files")
 os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
@@ -63,15 +55,16 @@ app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
 # Routers (el orden puede importar)
 # =========================
 # 1) Rutas estáticas/deterministas
-app.include_router(wsp.router)          # /wsp/... (WhatsApp: webhook y pruebas)
-app.include_router(vlateral.router)     # /ui/... (vistas de lectura)
+app.include_router(wsp.router)              # /wsp/...
+app.include_router(vlateral.router)         # /ui/...
 
 # 2) Rutas de negocio
-app.include_router(archivos.router)     # /archivos/... (subir/listar/review/firmar/descargar)
-app.include_router(ui.router)           # /ui/pedidos/list, /ui/pedidos/{id}/info, etc.
-app.include_router(pedidos.router)      # /pedidos (creación y operaciones de pedidos)
-app.include_router(proveedores.router)  # /proveedores (buscar por CUIT, upsert, agregar a pedido)
-app.include_router(auth.router)         # /auth (si aplica)
+app.include_router(archivos.router)         # /archivos/...
+app.include_router(ui.router)               # /ui/pedidos/...
+app.include_router(pedidos.router)          # /pedidos (CRUD y operaciones de pedido)
+app.include_router(pedidos_acciones.router) # /pedidos (decidir/patch)
+app.include_router(proveedores.router)      # /proveedores
+app.include_router(auth.router)             # /auth
 
 # =========================
 # Health & Root

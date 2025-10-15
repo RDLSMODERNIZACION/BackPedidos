@@ -4,36 +4,32 @@
 # - Upsert de proveedor (crear/actualizar por CUIT, razón social, tel, email)
 # - Upsert de teléfono
 # - Agregar proveedor a expediente (pedido) por CUIT y rol
+# - Listar proveedores vinculados a un pedido
 #
 # Requisitos: fastapi, psycopg[binary,pool], pydantic
 #   pip install fastapi "psycopg[binary,pool]" pydantic
 
-import os
 import re
-from typing import Optional, Literal, List, Tuple
+from typing import Optional, Literal
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
-from psycopg_pool import ConnectionPool
+from app.db import get_pool  # ✅ pool único para toda la app
 
 router = APIRouter(prefix="/proveedores", tags=["proveedores"])
 
-# ---------- DB pool ----------
-DB_URL = os.getenv("SUPABASE_DB_URL") or os.getenv("DATABASE_URL")
-if not DB_URL:
-    raise RuntimeError("Falta SUPABASE_DB_URL o DATABASE_URL")
-POOL = ConnectionPool(DB_URL)
-
 # ---------- Helpers ----------
 
-CUIT_RE = re.compile(r"\d{8,11}")           # tolerante a 8..11 dígitos (algunos padrones locales)
-E164_RE = re.compile(r"^\+[1-9][0-9]{7,14}$")  # E.164
+CUIT_RE = re.compile(r"\d{8,11}")  # tolerante a 8..11 dígitos
 
 def _norm_cuit(cuit: str) -> str:
     """Normaliza CUIT/CUIL -> solo dígitos (sin guiones)."""
     return re.sub(r"\D", "", cuit or "")
 
 def _to_e164(phone: str) -> str:
-    """Acepta '+549...','549...','54...' o solo dígitos -> retorna '+<digits>'. No valida país."""
+    """
+    Acepta '+549...','549...','54...' o solo dígitos -> retorna '+<digits>'.
+    (No valida país; solo formato internacional 8-15 dígitos)
+    """
     if not phone:
         raise ValueError("telefono vacío")
     digits = re.sub(r"\D", "", phone)
@@ -51,7 +47,7 @@ def _fetch_proveedor_by_cuit(cur, cuit_norm: str):
     return cur.fetchone()
 
 def _ensure_proveedor(cur, cuit_norm: str, razon_social: Optional[str], email: Optional[str]):
-    """Devuelve (id) creando proveedor si no existe. Usa razon_social fallback si es necesario."""
+    """Devuelve (id) creando proveedor si no existe. Usa razon_social fallback si no viene."""
     row = _fetch_proveedor_by_cuit(cur, cuit_norm)
     if row:
         return row[0]
@@ -93,19 +89,17 @@ class AddProveedorToPedidoIn(BaseModel):
     telefono: Optional[str] = Field(None, description="Si viene, se setea/actualiza el teléfono")
     razon_social: Optional[str] = None
     email_contacto: Optional[str] = None
-    set_adjudicado: bool = Field(False, description="Si rol=adjudicatario y querés reflejarlo en pedido.adjudicado_a")
+    set_adjudicado: bool = Field(False, description="Si rol=adjudicatario, refleja en pedido.adjudicado_a")
 
 # ---------- Endpoints ----------
 
 @router.get("/by-cuit/{cuit}", response_model=ProviderOut)
 def get_by_cuit(cuit: str):
-    """
-    Trae proveedor por CUIT. Normaliza a dígitos (cuit_num).
-    """
+    """Trae proveedor por CUIT. Normaliza a dígitos (cuit_num)."""
     cuit_norm = _norm_cuit(cuit)
     if not CUIT_RE.fullmatch(cuit_norm or ""):
         raise HTTPException(400, "CUIT inválido")
-    with POOL.connection() as con, con.cursor() as cur:
+    with get_pool().connection() as con, con.cursor() as cur:
         row = _fetch_proveedor_by_cuit(cur, cuit_norm)
         if not row:
             raise HTTPException(404, "Proveedor no encontrado")
@@ -116,11 +110,9 @@ def get_by_cuit(cuit: str):
 
 @router.get("/search")
 def search(q: str = Query(..., description="CUIT (parcial) o razón social (ilike)"), limit: int = 10):
-    """
-    Búsqueda simple por CUIT/razón social para autocompletar en el front.
-    """
+    """Búsqueda simple por CUIT/razón social para autocompletar en el front."""
     q_digits = _norm_cuit(q)
-    with POOL.connection() as con, con.cursor() as cur:
+    with get_pool().connection() as con, con.cursor() as cur:
         if q_digits and len(q_digits) >= 4:
             cur.execute("""
               SELECT id, cuit, razon_social, email_contacto, telefono
@@ -140,19 +132,17 @@ def search(q: str = Query(..., description="CUIT (parcial) o razón social (ilik
               LIMIT %s
             """, (f"%{q}%", limit))
         rows = cur.fetchall()
-        return [
-            {
-                "id": r[0], "cuit": r[1], "razon_social": r[2],
-                "email_contacto": r[3], "telefono": r[4]
-            } for r in rows
-        ]
+    return [
+        {"id": r[0], "cuit": r[1], "razon_social": r[2], "email_contacto": r[3], "telefono": r[4]}
+        for r in rows
+    ]
 
 @router.post("/upsert", response_model=ProviderOut)
 def upsert_proveedor(body: UpsertProveedorIn):
     """
     Crea o actualiza un proveedor por CUIT.
     - Requiere: cuit, razon_social
-    - Opcionales: telefono (normalizado a E.164), email_contacto
+    - Opcionales: telefono (E.164), email_contacto
     - Si el teléfono está en otro proveedor:
         * transfer_if_in_use=false -> 409 Conflict
         * transfer_if_in_use=true  -> mueve el teléfono a este proveedor
@@ -168,7 +158,7 @@ def upsert_proveedor(body: UpsertProveedorIn):
         except Exception as e:
             raise HTTPException(400, f"Teléfono inválido: {e}")
 
-    with POOL.connection() as con, con.cursor() as cur:
+    with get_pool().connection() as con, con.cursor() as cur:
         row = _fetch_proveedor_by_cuit(cur, cuit_norm)
 
         if not row:
@@ -230,7 +220,7 @@ def upsert_telefono(body: UpsertPhoneIn):
     except Exception as e:
         raise HTTPException(400, f"Teléfono inválido: {e}")
 
-    with POOL.connection() as con, con.cursor() as cur:
+    with get_pool().connection() as con, con.cursor() as cur:
         dst = _fetch_proveedor_by_cuit(cur, cuit_norm)
         if not dst:
             raise HTTPException(404, "Proveedor no encontrado para ese CUIT")
@@ -275,7 +265,7 @@ def agregar_a_pedido(body: AddProveedorToPedidoIn):
         except Exception as e:
             raise HTTPException(400, f"Teléfono inválido: {e}")
 
-    with POOL.connection() as con, con.cursor() as cur:
+    with get_pool().connection() as con, con.cursor() as cur:
         # confirmar que el pedido existe
         cur.execute("SELECT 1 FROM public.pedido WHERE id = %s", (body.pedido_id,))
         if not cur.fetchone():
@@ -321,3 +311,43 @@ def agregar_a_pedido(body: AddProveedorToPedidoIn):
         "rol": body.rol,
         "adjudicado_set": bool(body.set_adjudicado and body.rol == "adjudicatario"),
     }
+
+@router.get("/by-pedido/{pedido_id}")
+def proveedores_by_pedido(pedido_id: int, limit: int = 50):
+    """Lista proveedores vinculados a un pedido, con rol."""
+    if pedido_id <= 0:
+        raise HTTPException(400, "pedido_id inválido")
+    with get_pool().connection() as con, con.cursor() as cur:
+        # confirmar que el pedido existe (útil para 404 temprano)
+        cur.execute("SELECT 1 FROM public.pedido WHERE id = %s", (pedido_id,))
+        if not cur.fetchone():
+            raise HTTPException(404, "Pedido no encontrado")
+
+        cur.execute("""
+          SELECT
+            pr.id       AS proveedor_id,
+            pr.cuit,
+            pr.razon_social,
+            pr.telefono,
+            pp.rol,
+            p.updated_at
+          FROM public.pedido_proveedor pp
+          JOIN public.proveedor pr ON pr.id = pp.proveedor_id
+          JOIN public.pedido    p  ON p.id  = pp.pedido_id
+          WHERE pp.pedido_id = %s
+          ORDER BY p.updated_at DESC
+          LIMIT %s
+        """, (pedido_id, limit))
+        rows = cur.fetchall()
+
+    return [
+        {
+            "proveedor_id": r[0],
+            "cuit": r[1],
+            "razon_social": r[2],
+            "telefono": r[3],
+            "rol": r[4],
+            "updated_at": r[5].isoformat() if r[5] else None,
+        }
+        for r in rows
+    ]

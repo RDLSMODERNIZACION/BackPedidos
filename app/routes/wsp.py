@@ -7,7 +7,7 @@ import os, httpx, re
 from typing import Optional, List, Tuple
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
-from psycopg_pool import ConnectionPool
+from app.db import get_pool  # ✅ pool único para toda la app
 
 router = APIRouter(prefix="/wsp", tags=["whatsapp"])
 
@@ -27,12 +27,6 @@ def verify_webhook(request: Request):
     if p.get("hub.mode") == "subscribe" and p.get("hub.verify_token") == VERIFY_TOKEN:
         return Response(content=p.get("hub.challenge", "0"), media_type="text/plain")
     raise HTTPException(403, "Verify token inválido")
-
-# ========== DB pool ==========
-DB_URL = os.getenv("SUPABASE_DB_URL") or os.getenv("DATABASE_URL")
-if not DB_URL:
-    raise RuntimeError("Falta SUPABASE_DB_URL o DATABASE_URL")
-POOL = ConnectionPool(DB_URL)
 
 # ========== Helpers ==========
 ESTADO_EMOJI = {
@@ -134,13 +128,13 @@ def _provider_id_for_msisdn(msisdn_plus: str) -> Optional[int]:
     variants = _variants_plus(msisdn_plus)
     if not variants:
         return None
-    with POOL.connection() as con, con.cursor() as cur:
+    with get_pool().connection() as con, con.cursor() as cur:
         cur.execute("SELECT id FROM public.proveedor WHERE telefono = ANY(%s) LIMIT 1", (variants,))
         row = cur.fetchone()
         return row[0] if row else None
 
 def _fetch_mis_pedidos(prov_id: int, limit: int = 5) -> List[Tuple[int, str, str, object]]:
-    with POOL.connection() as con, con.cursor() as cur:
+    with get_pool().connection() as con, con.cursor() as cur:
         cur.execute("""
           SELECT p.id, COALESCE(p.numero,'(s/n)'), p.estado, p.updated_at
           FROM public.pedido_proveedor pp
@@ -152,7 +146,7 @@ def _fetch_mis_pedidos(prov_id: int, limit: int = 5) -> List[Tuple[int, str, str
         return cur.fetchall()
 
 def _fetch_pedido_by_id(prov_id: int, pid: int):
-    with POOL.connection() as con, con.cursor() as cur:
+    with get_pool().connection() as con, con.cursor() as cur:
         cur.execute("""
           SELECT p.id, COALESCE(p.numero,'(s/n)'), p.estado, p.updated_at
           FROM public.pedido_proveedor pp
@@ -162,7 +156,7 @@ def _fetch_pedido_by_id(prov_id: int, pid: int):
         return cur.fetchone()
 
 def _fetch_pedido_by_num(prov_id: int, numero: str):
-    with POOL.connection() as con, con.cursor() as cur:
+    with get_pool().connection() as con, con.cursor() as cur:
         cur.execute("""
           SELECT p.id, COALESCE(p.numero,'(s/n)'), p.estado, p.updated_at
           FROM public.pedido_proveedor pp

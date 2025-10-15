@@ -7,23 +7,14 @@
 
 from fastapi import APIRouter, HTTPException
 from fastapi.encoders import jsonable_encoder
-from typing import Any, Dict, List, Optional
-import os
-import psycopg
+from typing import Any, Optional
 from psycopg.rows import dict_row
+
+from app.db import get_conn  # ✅ usa el pool único (retry + transaction mode)
 
 router = APIRouter(prefix="/ui", tags=["ui"])
 
-# ---------- DB helpers ----------
-def _db_url() -> str:
-    url = os.getenv("SUPABASE_DB_URL") or os.getenv("DATABASE_URL")
-    if not url:
-        raise RuntimeError("Falta SUPABASE_DB_URL/DATABASE_URL en el entorno")
-    return url
-
-def _get_conn():
-    return psycopg.connect(_db_url(), row_factory=dict_row)
-
+# ---------- Helpers ----------
 def _iso(dt: Optional[Any]) -> Optional[str]:
     try:
         return dt.isoformat() if dt is not None else None
@@ -94,7 +85,7 @@ def get_pedido_info(pedido_id: int):
     - modulo_payload (JSON), ambito_payload (JSON)
     """
     try:
-        with _get_conn() as con, con.cursor() as cur:
+        with get_conn() as con, con.cursor(row_factory=dict_row) as cur:
             cur.execute(SQL_INFO_BY_ID, (pedido_id,))
             row = cur.fetchone()
             if not row:
@@ -112,7 +103,7 @@ def get_pedido_archivos(pedido_id: int):
     Respuesta: { items: [{ id, pedido_id, kind, filename, content_type, size_bytes, uploaded_at, review_*, url }] }
     """
     try:
-        with _get_conn() as con, con.cursor() as cur:
+        with get_conn() as con, con.cursor(row_factory=dict_row) as cur:
             cur.execute(SQL_FILES_BY_PEDIDO, (pedido_id,))
             rows = cur.fetchall() or []
 
@@ -158,12 +149,11 @@ def get_pedido_etapas(pedido_id: int):
     Si no hay fila, devuelve {}.
     """
     try:
-        with _get_conn() as con, con.cursor() as cur:
+        with get_conn() as con, con.cursor(row_factory=dict_row) as cur:
             cur.execute(SQL_ETAPAS_BY_PEDIDO, (pedido_id,))
             row = cur.fetchone()
             if not row:
                 return jsonable_encoder({})
-            # fastapi jsonable_encoder ya serializa datetimes → ISO
             return jsonable_encoder(row)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"v_pedido_etapas_error: {e}")

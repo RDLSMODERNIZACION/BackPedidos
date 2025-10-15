@@ -16,6 +16,7 @@ from fastapi.encoders import jsonable_encoder
 from typing import Optional, Any
 from psycopg.rows import dict_row
 from uuid import uuid4
+from urllib.parse import quote
 import os
 import httpx
 
@@ -53,6 +54,23 @@ def _iso(dt: Optional[Any]) -> Optional[str]:
     except Exception:
         return dt
 
+def _parse_storage_path(storage_path: str) -> tuple[str, str]:
+    """
+    Espera 'supabase://<bucket>/<key>' y devuelve (bucket, key) saneados.
+    """
+    if not storage_path.startswith("supabase://"):
+        raise HTTPException(status_code=400, detail="Este archivo no está en Supabase Storage")
+    try:
+        _, bucket_and_key = storage_path.split("://", 1)
+        bucket, key = bucket_and_key.split("/", 1)
+    except Exception:
+        raise HTTPException(status_code=400, detail="storage_path inválido")
+    bucket = bucket.strip().strip("/")
+    key = key.lstrip("/")  # sin slash inicial
+    if not bucket or not key:
+        raise HTTPException(status_code=400, detail="bucket/key inválidos en storage_path")
+    return bucket, key
+
 # =========================
 # Upload (UPSERT por (pedido_id, tipo_doc))
 # =========================
@@ -89,9 +107,13 @@ async def upload_archivo(
         if not cur.fetchone():
             raise HTTPException(status_code=404, detail="Pedido no encontrado")
 
-    # Subir a Storage (uuid → versión nueva en el bucket)
+    # Subir a Storage (uuid → versión nueva en el bucket) con URL-encode
     object_key = _sb_object_path(pedido_id, tipo_doc, archivo.filename)
-    upload_url = "{}/storage/v1/object/{}/{}".format(SUPABASE_URL, SUPABASE_BUCKET, object_key)
+    upload_url = "{}/storage/v1/object/{}/{}".format(
+        SUPABASE_URL,
+        quote(SUPABASE_BUCKET, safe=""),
+        quote(object_key,   safe="/"),
+    )
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
             upload_url,
@@ -179,11 +201,6 @@ def list_archivos_por_pedido(pedido_id: int):
 
 # =========================
 # Review (aprobado / observado)
-# Reglas:
-# - si decision == 'aprobado' y tipo_doc == 'presupuesto_*'  y estado actual == 'enviado'   → 'aprobado'
-# - si decision == 'aprobado' y tipo_doc == 'formal_pdf'                                    → 'en_proceso'
-# - si decision == 'aprobado' y tipo_doc == 'expediente_1'                                  → 'area_pago'
-# - si decision == 'aprobado' y tipo_doc == 'expediente_2'                                  → 'cerrado'
 # =========================
 @router.post("/{archivo_id}/review")
 def review_archivo(
@@ -332,13 +349,13 @@ async def get_signed_download(archivo_id: int, expires_sec: int = 600):
             raise HTTPException(status_code=404, detail="Archivo no encontrado")
 
     storage_path: str = row["storage_path"] or ""
-    if not storage_path.startswith("supabase://"):
-        raise HTTPException(status_code=400, detail="Este archivo no está en Supabase Storage")
+    bucket, key = _parse_storage_path(storage_path)
 
-    _, bucket_and_key = storage_path.split("://", 1)
-    bucket, key = bucket_and_key.split("/", 1)
-
-    sign_url = "{}/storage/v1/object/sign/{}/{}".format(SUPABASE_URL, bucket, key)
+    sign_url = "{}/storage/v1/object/sign/{}/{}".format(
+        SUPABASE_URL,
+        quote(bucket, safe=""),
+        quote(key,    safe="/"),
+    )
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             sign_url,
@@ -348,7 +365,17 @@ async def get_signed_download(archivo_id: int, expires_sec: int = 600):
         if r.status_code != 200:
             raise HTTPException(status_code=r.status_code, detail="Error firmando URL: {}".format(r.text))
         payload = r.json()
-        signed_url = "{}{}".format(SUPABASE_URL, payload["signedURL"])
+        signed_path = payload.get("signedURL") or payload.get("signedUrl") or ""
+
+    # Normalizar absoluta
+    if signed_path.startswith("/storage/"):
+        signed_url = f"{SUPABASE_URL}{signed_path}"
+    elif signed_path.startswith("/object/"):
+        signed_url = f"{SUPABASE_URL}/storage/v1{signed_path}"
+    elif signed_path.startswith("http"):
+        signed_url = signed_path
+    else:
+        signed_url = f"{SUPABASE_URL}/storage/v1/{signed_path.lstrip('/')}"
 
     return {
         "url": signed_url,
@@ -370,13 +397,13 @@ async def download_redirect(archivo_id: int, expires_sec: int = 600):
             raise HTTPException(status_code=404, detail="Archivo no encontrado")
 
     storage_path: str = row["storage_path"] or ""
-    if not storage_path.startswith("supabase://"):
-        raise HTTPException(status_code=400, detail="Este archivo no está en Supabase Storage")
+    bucket, key = _parse_storage_path(storage_path)
 
-    _, bucket_and_key = storage_path.split("://", 1)
-    bucket, key = bucket_and_key.split("/", 1)
-
-    sign_url = "{}/storage/v1/object/sign/{}/{}".format(SUPABASE_URL, bucket, key)
+    sign_url = "{}/storage/v1/object/sign/{}/{}".format(
+        SUPABASE_URL,
+        quote(bucket, safe=""),
+        quote(key,    safe="/"),
+    )
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             sign_url,
@@ -386,6 +413,15 @@ async def download_redirect(archivo_id: int, expires_sec: int = 600):
         if r.status_code != 200:
             raise HTTPException(status_code=r.status_code, detail="Error firmando URL: {}".format(r.text))
         payload = r.json()
-        signed_url = "{}{}".format(SUPABASE_URL, payload["signedURL"])
+        signed_path = payload.get("signedURL") or ""
+
+    if signed_path.startswith("/storage/"):
+        signed_url = f"{SUPABASE_URL}{signed_path}"
+    elif signed_path.startswith("/object/"):
+        signed_url = f"{SUPABASE_URL}/storage/v1{signed_path}"
+    elif signed_path.startswith("http"):
+        signed_url = signed_path
+    else:
+        signed_url = f"{SUPABASE_URL}/storage/v1/{signed_path.lstrip('/')}"
 
     return RedirectResponse(url=signed_url, status_code=307)

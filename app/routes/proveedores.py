@@ -5,6 +5,8 @@
 # - Upsert de teléfono
 # - Agregar proveedor a expediente (pedido) por CUIT y rol
 # - Listar proveedores vinculados a un pedido
+# - Editar proveedor por ID (PATCH)
+# - Desvincular proveedor de un pedido (DELETE)
 #
 # Requisitos: fastapi, psycopg[binary,pool], pydantic
 #   pip install fastapi "psycopg[binary,pool]" pydantic
@@ -90,6 +92,12 @@ class AddProveedorToPedidoIn(BaseModel):
     razon_social: Optional[str] = None
     email_contacto: Optional[str] = None
     set_adjudicado: bool = Field(False, description="Si rol=adjudicatario, refleja en pedido.adjudicado_a")
+
+class UpdateProveedorIn(BaseModel):
+    razon_social: Optional[str] = None
+    email_contacto: Optional[str] = None
+    telefono: Optional[str] = None
+    transfer_if_in_use: bool = False
 
 # ---------- Endpoints ----------
 
@@ -351,3 +359,79 @@ def proveedores_by_pedido(pedido_id: int, limit: int = 50):
         }
         for r in rows
     ]
+
+@router.patch("/{proveedor_id}", response_model=ProviderOut)
+def update_proveedor(proveedor_id: int, body: UpdateProveedorIn):
+    """Editar proveedor por ID (razón social, email, teléfono)."""
+    if proveedor_id <= 0:
+        raise HTTPException(400, "proveedor_id inválido")
+
+    tel: Optional[str] = None
+    if body.telefono:
+        try:
+            tel = _to_e164(body.telefono)
+        except Exception as e:
+            raise HTTPException(400, f"Teléfono inválido: {e}")
+
+    with get_pool().connection() as con, con.cursor() as cur:
+        # existe?
+        cur.execute("SELECT id FROM public.proveedor WHERE id = %s", (proveedor_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Proveedor no encontrado")
+
+        # teléfono único (si viene)
+        if tel is not None:
+            cur.execute("SELECT id FROM public.proveedor WHERE telefono = %s AND id <> %s", (tel, proveedor_id))
+            holder = cur.fetchone()
+            if holder:
+                if not body.transfer_if_in_use:
+                    raise HTTPException(409, "Ese teléfono ya está asignado a otro proveedor")
+                # transferir: limpiamos en el anterior
+                cur.execute("UPDATE public.proveedor SET telefono = NULL WHERE id = %s", (holder[0],))
+            cur.execute("UPDATE public.proveedor SET telefono = %s WHERE id = %s", (tel, proveedor_id))
+
+        # actualizar razón/email si vienen
+        if body.razon_social is not None or body.email_contacto is not None:
+            cur.execute("""
+              UPDATE public.proveedor
+              SET razon_social = COALESCE(%s, razon_social),
+                  email_contacto = COALESCE(%s, email_contacto),
+                  updated_at = now()
+              WHERE id = %s
+            """, (body.razon_social, body.email_contacto, proveedor_id))
+
+        # devolver final
+        cur.execute("""
+          SELECT id, cuit, razon_social, email_contacto, telefono, created_at, updated_at
+          FROM public.proveedor WHERE id = %s
+        """, (proveedor_id,))
+        out = cur.fetchone(); con.commit()
+
+    return ProviderOut(
+        id=out[0], cuit=out[1], razon_social=out[2], email_contacto=out[3],
+        telefono=out[4], created_at=str(out[5]) if out[5] else None, updated_at=str(out[6]) if out[6] else None
+    )
+
+@router.delete("/pedido/{pedido_id}/{proveedor_id}")
+def desvincular_proveedor_de_pedido(pedido_id: int, proveedor_id: int):
+    """Quitar (DELETE) el vínculo (pedido_id, proveedor_id) en pedido_proveedor."""
+    if pedido_id <= 0 or proveedor_id <= 0:
+        raise HTTPException(400, "IDs inválidos")
+    with get_pool().connection() as con, con.cursor() as cur:
+        # validar que el vínculo exista
+        cur.execute("""
+          SELECT 1 FROM public.pedido_proveedor
+          WHERE pedido_id = %s AND proveedor_id = %s
+        """, (pedido_id, proveedor_id))
+        if not cur.fetchone():
+            raise HTTPException(404, "El proveedor no está vinculado a ese pedido")
+
+        # borrar vínculo
+        cur.execute("""
+          DELETE FROM public.pedido_proveedor
+          WHERE pedido_id = %s AND proveedor_id = %s
+        """, (pedido_id, proveedor_id))
+        con.commit()
+
+    return {"ok": True, "removed": 1}

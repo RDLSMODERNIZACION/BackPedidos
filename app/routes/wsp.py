@@ -167,7 +167,7 @@ def _fetch_pedido_by_num(prov_id: int, numero: str):
 
 def _pretty_menu() -> str:
     return (
-        "🟩 *DIRAC · Proveedores*\n"
+        "🟩 *Municipalidad Rincon de Los Sauces*\n"
         "Elegí una opción enviando el número o escribiendo el comando:\n"
         "  1) 📋 *Mis pedidos* (opcional: `MIS PEDIDOS 5`)\n"
         "  2) 🔎 *Consultar por Expediente*\n"

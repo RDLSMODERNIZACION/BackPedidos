@@ -181,7 +181,7 @@ def _pretty_menu() -> str:
         "  3) 🧾 *Consultar por ID*\n"
         "     Ejemplos: `3 83`, `ID 83`, `#83`\n"
         "\n"
-        "Tip: después de ver *Mis pedidos*, podés contestar solo el número de la lista (1–9) para ver el detalle. ✅"
+        "Tip: después de ver *Mis pedidos*, podés contestar solo el número (1–9) para ver el detalle. ✅"
     )
 
 def _pretty_list(rows: List[Tuple[int,str,str,object]]) -> str:
@@ -241,7 +241,7 @@ def receive_webhook(payload: dict):
     except Exception:
         return {"ok": True}
     if "messages" not in changes:
-        return {"ok": True"}
+        return {"ok": True}
 
     msg = changes["messages"][0]
     from_no_plus = msg.get("from") or ""
@@ -303,7 +303,7 @@ def receive_webhook(payload: dict):
             send_text(from_no_plus, f"🔎 No encuentro *{numero}* vinculado a tu CUIT.\nEscribí `menu` para ver opciones.")
         return {"ok": True}
 
-    # 3) Consultar por ID (acepta: "3 83", "ID 83", "#83")
+    # 3) Consultar por ID (acepta: "3 83", "ID 83", "#83" o solo dígitos >=2)
     m_id3 = re.fullmatch(r"3\s+(\d+)", UP)
     m_id  = re.fullmatch(r"(?:ID|#)\s*(\d+)", UP)
     m_only_digits = re.fullmatch(r"\d{2,}", UP)  # si manda solo dígitos (>=2) tratamos como ID

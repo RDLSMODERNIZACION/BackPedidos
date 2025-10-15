@@ -6,11 +6,25 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.routing import APIRoute
 
 from app.routes import auth, pedidos, ui, vlateral, wsp, archivos, proveedores
+from app.db import open_pool, close_pool, get_pool  # ✅ pool único
 
 APP_NAME = "Dirac – Pedidos API"
 APP_VER = "1.0"
 
 app = FastAPI(title=APP_NAME, version=APP_VER)
+
+# =========================
+# Pool lifecycle
+# =========================
+@app.on_event("startup")
+def _on_startup():
+    # abre 1 solo pool global para todo el proceso (evita MaxClientsInSessionMode)
+    open_pool()
+
+@app.on_event("shutdown")
+def _on_shutdown():
+    # cierra el pool prolijo
+    close_pool()
 
 # =========================
 # CORS
@@ -56,7 +70,7 @@ app.include_router(vlateral.router)     # /ui/... (vistas de lectura)
 app.include_router(archivos.router)     # /archivos/... (subir/listar/review/firmar/descargar)
 app.include_router(ui.router)           # /ui/pedidos/list, /ui/pedidos/{id}/info, etc.
 app.include_router(pedidos.router)      # /pedidos (creación y operaciones de pedidos)
-app.include_router(proveedores.router)  # /proveedores (buscar por CUIT, upsert teléfono, agregar a pedido)
+app.include_router(proveedores.router)  # /proveedores (buscar por CUIT, upsert, agregar a pedido)
 app.include_router(auth.router)         # /auth (si aplica)
 
 # =========================
@@ -69,6 +83,17 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True}
+
+# (Opcional) ping a DB y ver tope del pool
+@app.get("/__db_ping")
+def db_ping():
+    try:
+        with get_pool().connection() as con, con.cursor() as cur:
+            cur.execute("select 1")
+            one = cur.fetchone()
+        return {"ok": True, "one": int(one[0]), "pool_max": get_pool().max_size}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 # =========================
 # Diagnóstico de rutas (opcional)
